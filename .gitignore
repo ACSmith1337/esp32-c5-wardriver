@@ -1,0 +1,7 @@
+build/
+*.log
+*.csv
+*.o
+*.d
+build/
+src/*.ino.cpp
