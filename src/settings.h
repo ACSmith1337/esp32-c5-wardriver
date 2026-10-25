@@ -15,7 +15,6 @@
 
 #define CLICK_NAME "Click"
 #define ALARM_NAME "Alarm"
-#define WARDRIFT_KEY_NAME  "wd_key"    // Wardrift.net API key (String)
 #define VIBE_NAME  "Vibration"
 #define TIME_NAME  "Timestamp"
 #define SEN_SUB    "Subghz Sens"
@@ -29,9 +28,13 @@
 // Chunk 1: New setting key names
 // ============================================================
 #define WDG_KEY_NAME       "wdg_key"   // WDG Wars API key (String)
+#define WARDRIFT_KEY_NAME  "wd_key"    // wardrift.net device API key (String)
 #define TRIGGER_SSID_NAME  "t_ssid"    // Dock trigger SSID e.g. "K1T" (String)
 #define TRIGGER_PASS_NAME  "t_pass"    // Dock trigger SSID password (String)
 #define ADMIN_PASS_NAME    "a_pass"    // Basic Auth password for web UI (String)
+#define ADMIN_AP_SSID_NAME "ap_ssid"   // Admin access point SSID (String)
+#define ADMIN_AP_PASS_NAME "ap_pass"   // Admin access point password (String)
+#define CORE_MAC_NAME      "core_mac"  // Node's permitted Core MAC (String)
 #define DEBUG_LOG_NAME     "dbg_en"    // SD debug log enabled (bool)
 // SSID exclusion list keys:  "sx_0" through "sx_9"   (String each)
 // Geofence keys:             "geo_0" through "geo_4" (String, JSON encoded)

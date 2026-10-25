@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include "configs.h"
 #include "BatteryInterface.h"
 #include "Buffer.h"
@@ -11,6 +10,7 @@
 #include "utils.h"
 #include "ui.h"
 #include "logger.h"
+#include "ActivityLed.h"
 
 Buffer buffer;
 Settings settings;
@@ -19,6 +19,7 @@ BatteryInterface battery;
 WiFiOps wifi_ops;
 Utils utils;
 UI ui_obj;
+ActivityLed activity_led;
 bool g_force_display_redraw = false;
 
 SPIClass sharedSPI(SPI);
@@ -29,8 +30,6 @@ Switches u_btn = Switches(U_BTN, 1000, U_PULL);
 Switches d_btn = Switches(D_BTN, 1000, D_PULL);
 Switches c_btn = Switches(C_BTN, 1000, C_PULL);
 
-void setup();
-void loop();
 void setup() {
   Serial.begin(115200);
 
@@ -54,7 +53,7 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
 
-  digitalWrite(LED_PIN, LED_OFF);
+  activity_led.begin(LED_PIN, LED_ON, millis());
 
   // Load settings
   settings.begin();
@@ -120,12 +119,13 @@ void loop() {
   // Nodes
   else if ((wifi_ops.run_mode == NODE_MODE) && (wifi_ops.getNodeReady())) {
     wifi_ops.setCurrentScanMode(WIFI_WARDRIVING);
-    // LED handled by scan blink in runWardrive
   }
   else {
     wifi_ops.setCurrentScanMode(WIFI_STANDBY);
-    if (wifi_ops.run_mode == NODE_MODE)
-      digitalWrite(LED_PIN, LED_OFF);
   }
-}
 
+  if (wifi_ops.run_mode == NODE_MODE) {
+    activity_led.link(currentTime, wifi_ops.getHasCore(), wifi_ops.requiresCore());
+  }
+  activity_led.tick(currentTime);
+}

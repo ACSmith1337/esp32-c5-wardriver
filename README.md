@@ -1,47 +1,85 @@
-# ESP32-C5 Wardriver — with wardrift.net upload
+# WardriverC5v2
 
-Wardriver firmware for the ESP32-C5 (8 MB flash), based on
-[JCMK's ESP32DualBandWardriver](https://github.com/justcallmekoko/ESP32DualBandWardriver),
-built for the stock JCMK C5 rig (160x80 display, SD card, GPS).
+Clean-room variant of [JCMK's ESP32DualBandWardriver](https://github.com/justcallmekoko/ESP32DualBandWardriver) v2.3.2 for the ESP32-C5.
 
-It scans 2.4 GHz + 5 GHz and Bluetooth while you drive, writes the usual
-KISS logs to the SD card, and uploads your data to the services you set up
-in the settings page — including **wardrift.net**.
+Two additions on top of stock:
 
-## What's new compared to the original
+- **wardrift.net ingest.** Solo and Core logs can be uploaded to wardrift.net's device ingest API with a runtime `wdk_...` key. TLS is pinned to the ISRG roots. The key is stored on the device, never compiled in.
+- **XIAO node activity LED.** A bare Seeed XIAO ESP32-C5 node build drives the onboard GPIO27 LED with scan activity, an idle heartbeat, and a distinct link-loss beacon.
 
-- **wardrift.net uploads.** The firmware now uploads your wardrive logs to
-  wardrift.net, alongside WiGLE and WDG Wars. You enter your wardrift.net
-  API key in the settings page of the web UI (create one under
-  **API Keys** in your wardrift.net dashboard, device type `wardrive`).
-  Keys are stored on the device; nothing is built into the firmware.
-- **One action, three services.** The LCD menu's **Upload Wardrift** (and
-  the per-file upload links in the web UI) sends the same log to all three
-  services and shows a pass/fail result for each.
-- **Fixed for the stock C5 board.** Display orientation, the LED/backlight
-  pin conflict, and the exact flash procedure for this board were verified
-  on the real hardware.
-- **Ready-to-flash binaries.** `release/` contains the tested firmware for
-  this board, with checksums and flash instructions.
+The stock UI is kept. Additions are the wardrift.net settings section, per-service upload links, `Upload All`, web file delete, and bulk delete.
 
-## Getting started
+## Hardware
 
-1. Flash the firmware — see [`release/README-flash.txt`](release/README-flash.txt).
-2. Open the web UI at the device's IP (shown on boot, or check your router's
-   DHCP list).
-3. On the settings page, enter your WiGLE, WDG Wars, and wardrift.net
-   credentials.
-4. Drive. Then upload from the LCD menu or the web UI's file list. Your
-   routes show up in the wardrift.net portal.
+- ESP32-C5, 8 MB flash, 8 MB PSRAM.
+- JCMK carrier / ESP32-C5-DevKitC-1: display, SD, GPS, fuel gauge, LED GPIO28 active-high.
+- Seeed XIAO ESP32-C5 node: onboard LED GPIO27 active-low, no SD/GPS/display required.
 
-## Building from source
+## Build
 
-`BUILD-ESP32-C5.md` has the full, tested build and flash recipe
-(arduino-cli, esp32 core 3.3.0). The source is standard Arduino code in `src/`.
+Requires arduino-cli 1.5.x, esp32 core 3.3.0, ArduinoJson 6.18.x, NimBLE-Arduino 2.3.0, Adafruit ST7735, LinkedList, and MicroNMEA.
 
-## Repository layout
+JCMK build:
 
-- `src/` — firmware source
-- `release/` — tested binaries, checksums, flash notes
-- `BUILD-ESP32-C5.md` — build & flash recipe
-- `NOTES.md` — hardware and design notes
+```sh
+arduino-cli compile \
+  --fqbn "esp32:esp32:esp32c5:PartitionScheme=huge_app,PSRAM=enabled" \
+  --build-property "compiler.cpp.extra_flags=-DC5_WARDRIVER" \
+  --output-dir build/jcmk src
+```
+
+XIAO node build:
+
+```sh
+arduino-cli compile \
+  --fqbn "esp32:esp32:esp32c5:PartitionScheme=huge_app,PSRAM=enabled" \
+  --build-property "compiler.cpp.extra_flags=-DC5_WARDRIVER -DBOARD_XIAO_C5 -DNODE" \
+  --output-dir build/xiao src
+```
+
+`huge_app` is the single-app 3 MB layout used by the stock rig. For WiFi OTA, rebuild with `PartitionScheme=default_8MB` and add an OTA handler; the first migration still needs USB.
+
+## Flash
+
+App-only update over an existing `huge_app` layout:
+
+```sh
+esptool --chip esp32c5 --port COMx --baud 921600 \
+  write_flash -z 0x10000 build/jcmk/src.ino.bin
+```
+
+Full three-segment layout:
+
+```sh
+esptool --chip esp32c5 --port COMx --baud 921600 \
+  write_flash -z \
+  0x2000 build/jcmk/src.ino.bootloader.bin \
+  0x8000 build/jcmk/src.ino.partitions.bin \
+  0x10000 build/jcmk/src.ino.bin
+```
+
+Do not write an OTA-data blob at 0xE000 unless it is the exact matching image. A wrong blob at that offset boot-loops the C5.
+
+## Tests
+
+Host-side tests need no hardware:
+
+```sh
+cd tools
+g++ -std=c++17 -I../src test_led_pattern.cpp ../src/LedPattern.cpp -o test_led && ./test_led
+g++ -std=c++17 -I../src test_wardrift_format.cpp ../src/WardriftFormat.cpp -o test_wardrift && ./test_wardrift
+g++ -std=c++17 -I../src batch_dump.cpp ../src/WardriftFormat.cpp -o batch_dump
+python3 validate_batches.py <wardrive.log>
+```
+
+## Security
+
+- Wardrift keys are entered at runtime and stored in device settings. No key is compiled into the firmware.
+- wardrift.net ingest uses pinned ISRG roots, not `setInsecure()`.
+- WiGLE and WDG credentials are entered at runtime through the web UI.
+- The web UI has an optional Basic Auth password. Set one before exposing the device on an untrusted network.
+- The `wd_key` query parameter on `/upload` exists for remote recovery. Do not use it over an untrusted network.
+
+## License
+
+MIT. See `LICENSE`. Upstream firmware copyright Just Call Me Koko.

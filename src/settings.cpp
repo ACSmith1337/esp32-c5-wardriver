@@ -558,12 +558,31 @@ bool Settings::createDefaultSettings(fs::FS &fs, bool spec, uint8_t index, Strin
     jsonBuffer["Settings"][28]["range"]["min"] = false;
     jsonBuffer["Settings"][28]["range"]["max"] = true;
 
-    // [29] Wardrift.net API key
-    jsonBuffer["Settings"][29]["name"] = WARDRIFT_KEY_NAME;
+    // [29-31] Admin AP identity and optional Node-to-Core binding
+    jsonBuffer["Settings"][29]["name"] = ADMIN_AP_SSID_NAME;
     jsonBuffer["Settings"][29]["type"] = "String";
-    jsonBuffer["Settings"][29]["value"] = "";
+    jsonBuffer["Settings"][29]["value"] = "c5wardriver";
     jsonBuffer["Settings"][29]["range"]["min"] = "";
     jsonBuffer["Settings"][29]["range"]["max"] = "";
+
+    jsonBuffer["Settings"][30]["name"] = ADMIN_AP_PASS_NAME;
+    jsonBuffer["Settings"][30]["type"] = "String";
+    jsonBuffer["Settings"][30]["value"] = "c5wardriver";
+    jsonBuffer["Settings"][30]["range"]["min"] = "";
+    jsonBuffer["Settings"][30]["range"]["max"] = "";
+
+    // [32] wardrift.net device API key
+    jsonBuffer["Settings"][32]["name"] = WARDRIFT_KEY_NAME;
+    jsonBuffer["Settings"][32]["type"] = "String";
+    jsonBuffer["Settings"][32]["value"] = "";
+    jsonBuffer["Settings"][32]["range"]["min"] = "";
+    jsonBuffer["Settings"][32]["range"]["max"] = "";
+
+    jsonBuffer["Settings"][31]["name"] = CORE_MAC_NAME;
+    jsonBuffer["Settings"][31]["type"] = "String";
+    jsonBuffer["Settings"][31]["value"] = "";
+    jsonBuffer["Settings"][31]["range"]["min"] = "";
+    jsonBuffer["Settings"][31]["range"]["max"] = "";
 
     if (serializeJson(jsonBuffer, settings_string) == 0) {
       Logger::log(WARN_MSG, "Failed to write to string");

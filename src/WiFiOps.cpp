@@ -1,16 +1,68 @@
 #include "WiFiOps.h"
 #include "BatteryInterface.h"
 #include "ChannelDwell.h"
+#include "WigleFormat.h"
+#include "CoreBinding.h"
+#include "ActivityLed.h"
+#include "WardriftClient.h"
+#include "esp_mac.h"
 #include "esp_task_wdt.h"
 
 #include <cmath>
 #include <cstdlib>
-#include <cstdio>
-#include <cctype>
-#include <ctime>
 
 extern BatteryInterface battery;
+extern ActivityLed activity_led;
 extern bool g_force_display_redraw;
+
+WardriftClient wardrift_client;
+
+// Read one HTTP response with a Content-Length early exit. Returns the status
+// code (0 on transport failure) and leaves the body in `body`.
+static int readHttpResponse(WiFiClient& c, String& body, uint32_t timeoutMs) {
+  String headers;
+  headers.reserve(512);
+  uint32_t t0 = millis();
+  int header_end = -1;
+  while (millis() - t0 < timeoutMs) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      headers += ch;
+      if (headers.length() >= 4 && headers.endsWith("\r\n\r\n")) {
+        header_end = headers.length();
+        break;
+      }
+      if (headers.length() > 2048) break;
+    }
+    if (header_end > 0) break;
+    if (!c.connected() && !c.available()) break;
+    delay(5);
+  }
+  if (headers.length() < 12) return 0;
+
+  int status = 0;
+  sscanf(headers.c_str(), "HTTP/%*d.%*d %d", &status);
+
+  long content_length = -1;
+  int cl = headers.indexOf("Content-Length:");
+  if (cl < 0) cl = headers.indexOf("content-length:");
+  if (cl >= 0) content_length = headers.substring(cl + 15).toInt();
+
+  body.reserve(content_length > 0 && content_length < 8192
+                 ? (size_t)content_length + 8 : 256);
+  t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    while (c.available()) {
+      body += (char)c.read();
+      if (body.length() >= 8192) break;
+    }
+    if (content_length >= 0 && body.length() >= (size_t)content_length) break;
+    if (!c.connected() && !c.available()) break;
+    if (body.length() >= 8192) break;
+    delay(5);
+  }
+  return status;
+}
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static const char MAGIC[4] = {'E','N','O','W'};
@@ -24,6 +76,8 @@ static constexpr uint32_t REQ_MAX_MS     = 5000;  // cap retry interval
 static uint8_t g_core_mac[6] = {0};
 static bool g_have_core = false;
 static bool g_secure_ready = false;
+static uint8_t g_configured_core_mac[6] = {0};
+static bool g_core_mac_configured = false;
 
 static uint32_t g_hb_counter = 0;
 static unsigned long g_last_hb_ms = 0;
@@ -125,7 +179,7 @@ class scanCallbacks : public NimBLEScanCallbacks {
         if (gps.getFixStatus())
           do_save = true;
 
-        String wardrive_line = (String)advertisedDevice->getAddress().toString().c_str() + ",,[BLE]," + gps.getDatetime() + ",0," + (String)advertisedDevice->getRSSI() + "," + gps.getLat() + "," + gps.getLon() + "," + gps.getAlt() + "," + gps.getAccuracy() + ",BLE";
+        String wardrive_line = (String)advertisedDevice->getAddress().toString().c_str() + ",,[BLE]," + gps.getDatetime() + ",0,0," + (String)advertisedDevice->getRSSI() + "," + gps.getLat() + "," + gps.getLon() + "," + gps.getAlt() + "," + gps.getAccuracy() + ",,0,BLE";
         Logger::log(GUD_MSG, (String)wifi_ops.mac_history_cursor + " | " + wardrive_line);
 
         if (do_save)
@@ -146,10 +200,20 @@ class scanCallbacks : public NimBLEScanCallbacks {
 
       String enow_line = (String)advertisedDevice->getAddress().toString().c_str() + ",,[BLE],0," + (String)(String)advertisedDevice->getRSSI() + ",B";
       Logger::log(GUD_MSG, (String)wifi_ops.mac_history_cursor + " | " + enow_line);
-      if (wifi_ops.use_encryption)
-        wifi_ops.sendEncryptedStringToCore(enow_line);
-      else
-        wifi_ops.sendBroadcastStringPlain(enow_line);
+      bool sent = wifi_ops.use_encryption
+        ? wifi_ops.sendEncryptedStringToCore(enow_line)
+        : wifi_ops.sendBroadcastStringPlain(enow_line);
+      if (!sent) {
+        activity_led.tx_fail(millis());
+      } else {
+        // BLE callbacks can fire dozens of times per scan; show presence
+        // without turning the LED solid.
+        static uint32_t last_ble_pulse = 0;
+        if (millis() - last_ble_pulse > 1000) {
+          last_ble_pulse = millis();
+          activity_led.scan(millis(), 1);
+        }
+      }
     }
   }
 };
@@ -537,6 +601,22 @@ uint8_t WiFiOps::getActiveNodeCount() {
   return count;
 }
 
+bool WiFiOps::getNodeStatus(uint8_t active_index, NodeStatus& status) {
+  uint8_t current = 0;
+  const uint32_t now = millis();
+  for (uint8_t slot = 0; slot < MAX_NODES; ++slot) {
+    if (!(node_table[slot].flags & NODE_FLAG_ACTIVE)) continue;
+    if (current++ != active_index) continue;
+
+    status.mac_suffix = node_table[slot].mac_suffix;
+    status.start_channel = getNodeStartChannel(slot);
+    status.end_channel = getNodeEndChannel(slot);
+    status.last_seen_seconds = (now - node_table[slot].last_seen_ms) / 1000;
+    return true;
+  }
+  return false;
+}
+
 void WiFiOps::markAllActiveNodesAdminDirty() {
   for (uint8_t i = 0; i < MAX_NODES; i++) {
     if (node_table[i].flags & NODE_FLAG_ACTIVE) {
@@ -608,6 +688,16 @@ void WiFiOps::setFixedChannel(uint8_t ch) {
   esp_wifi_set_promiscuous(false);
 }
 
+String WiFiOps::getDeviceMacAddress() const {
+  uint8_t mac[6];
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK)
+    return "Unavailable";
+
+  char formatted_mac[18];
+  formatCoreMac(mac, formatted_mac);
+  return String(formatted_mac);
+}
+
 bool WiFiOps::addPeerWithMode(const uint8_t* mac, bool encrypt, const uint8_t lmk16[16]) {
   // If peer exists (possibly with wrong mode), delete it first
   if (esp_now_is_peer_exist(mac)) {
@@ -675,11 +765,13 @@ void WiFiOps::sendCoreRequest() {
   msg.type = MSG_CORE_REQUEST;
   msg.counter = 0;
 
-  // Broadcast peer must be unencrypted
-  addPeerWithMode(BROADCAST_MAC, false, nullptr);
+  const uint8_t* destination = g_core_mac_configured
+    ? g_configured_core_mac : BROADCAST_MAC;
+  addPeerWithMode(destination, false, nullptr);
 
-  esp_err_t res = esp_now_send(BROADCAST_MAC, (uint8_t*)&msg, sizeof(msg));
-  Serial.printf("NODE: Broadcast CORE_REQUEST -> %s (next in %lu ms)\n",
+  esp_err_t res = esp_now_send(destination, (uint8_t*)&msg, sizeof(msg));
+  Serial.printf("NODE: %s CORE_REQUEST -> %s (next in %lu ms)\n",
+                g_core_mac_configured ? "Unicast" : "Broadcast",
                 (res == ESP_OK) ? "OK" : "FAIL",
                 (unsigned long)g_req_interval_ms);
 }
@@ -844,7 +936,7 @@ void WiFiOps::sendHeartbeat() {
   msg.counter = g_hb_counter++;
 
   esp_err_t res;
-  if (wifi_ops.use_encryption) {
+  if (wifi_ops.use_encryption || g_core_mac_configured) {
     res = esp_now_send(g_core_mac, (uint8_t*)&msg, sizeof(msg));
   } else {
     res = esp_now_send(BROADCAST_MAC, (uint8_t*)&msg, sizeof(msg));
@@ -891,11 +983,12 @@ bool WiFiOps::sendEncryptedStringToCore(const String& s) {
 bool WiFiOps::sendBroadcastStringPlain(const String& s) {
   this->setFixedChannel(ESPNOW_CHANNEL);
 
-  static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  const uint8_t* destination = g_core_mac_configured
+    ? g_configured_core_mac : BROADCAST_MAC;
 
-  if (!esp_now_is_peer_exist(bcast_mac)) {
+  if (!esp_now_is_peer_exist(destination)) {
     esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, bcast_mac, 6);
+    memcpy(peerInfo.peer_addr, destination, 6);
     peerInfo.channel = 0;       // follow current home channel
     peerInfo.encrypt = false;   // plaintext broadcast
 
@@ -917,7 +1010,7 @@ bool WiFiOps::sendBroadcastStringPlain(const String& s) {
   msg.text[n] = '\0';
   msg.len = (uint16_t)n;
 
-  esp_err_t res = esp_now_send(bcast_mac, (uint8_t*)&msg, sizeof(msg));
+  esp_err_t res = esp_now_send(destination, (uint8_t*)&msg, sizeof(msg));
 
   if (res != ESP_OK) {
     Serial.printf("NODE: Broadcast plaintext send FAIL (err=%d)\n", (int)res);
@@ -1075,17 +1168,19 @@ void WiFiOps::OnDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, i
             if (rec.type == "B")
               type = "BLE";
 
+            const uint16_t frequency = type == "WIFI" ? wigleFrequencyMHz(rec.channel) : 0;
             String wardrive_line =
               rec.bssid + "," +
               rec.essid + "," +
               rec.security + "," +
               gps.getDatetime() + "," +
               (String)rec.channel + "," +
+              (String)frequency + "," +
               (String)rec.rssi + "," +
               gps.getLat() + "," +
               gps.getLon() + "," +
               gps.getAlt() + "," +
-              gps.getAccuracy() + "," +
+              gps.getAccuracy() + ",,0," +
               type;
 
             Logger::log(GUD_MSG, wardrive_line);
@@ -1142,6 +1237,12 @@ void WiFiOps::OnDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, i
   }
 
   if (wifi_ops.run_mode == NODE_MODE) {
+
+    if (g_core_mac_configured &&
+        !coreMacMatches(g_configured_core_mac, info->src_addr)) {
+      Serial.printf("NODE: Ignoring packet from non-configured Core %s\n", srcMacStr);
+      return;
+    }
 
     if (msgType == MSG_CORE_REPLY) {
       if (len < (int)sizeof(enow_text_msg_t)) return;
@@ -1221,10 +1322,24 @@ void WiFiOps::startESPNow() {
     Logger::log(STD_MSG, "Role: NODE");
     Logger::log(STD_MSG, "NODE: Fixed channel " + (String)ESPNOW_CHANNEL + ", probing for CORE...\n");
 
-    g_last_req_ms = millis();
+    String configured_core = settings.loadSetting<String>(CORE_MAC_NAME);
+    configured_core.trim();
+    g_core_mac_configured = parseCoreMac(configured_core.c_str(), g_configured_core_mac);
+    if (!configured_core.isEmpty() && !g_core_mac_configured)
+      Logger::log(WARN_MSG, "NODE: Ignoring invalid configured Core MAC");
 
-    if (this->use_encryption)
-      this->sendCoreRequest();
+    if (g_core_mac_configured) {
+      memcpy(g_core_mac, g_configured_core_mac, sizeof(g_core_mac));
+      char core_mac_string[18];
+      formatCoreMac(g_configured_core_mac, core_mac_string);
+      Logger::log(STD_MSG, "NODE: Bound to Core " + String(core_mac_string));
+    }
+
+    g_have_core = false;
+    g_secure_ready = false;
+    g_req_interval_ms = REQ_INITIAL_MS;
+    g_last_req_ms = millis();
+    this->sendCoreRequest();
   }
 }
 
@@ -1260,12 +1375,17 @@ bool WiFiOps::getSecureReady() {
 }
 
 bool WiFiOps::getNodeReady() {
-  if (!this->use_encryption)
+  if (!this->use_encryption && !g_core_mac_configured)
     return true;
-  else if ((this->getHasCore()) && (this->getSecureReady()))
+  else if (this->getHasCore() &&
+           (!this->use_encryption || this->getSecureReady()))
     return true;
 
   return false;
+}
+
+bool WiFiOps::requiresCore() {
+  return this->use_encryption || g_core_mac_configured;
 }
 
 uint8_t WiFiOps::getCurrentScanMode() {
@@ -1360,11 +1480,9 @@ int WiFiOps::runWardrive(uint32_t currentTime) {
 
       scan_status = WiFi.scanComplete();
 
-      // Pause if scan is running already — blink activity LED while scanning
-      if (scan_status == WIFI_SCAN_RUNNING) { // Scan is still running
-        digitalWrite(LED_PIN, ((millis() / 250) % 2) ? LED_ON : LED_OFF);
+      // Pause if scan is running already
+      if (scan_status == WIFI_SCAN_RUNNING) // Scan is still running
         delay(1);
-      }
       else if (scan_status == WIFI_SCAN_FAILED) { // Scan is failed or not started
         if (this->run_mode == NODE_MODE)
           this->startNextNodeAssignedScan();
@@ -1648,6 +1766,8 @@ uint16_t WiFiOps::processWardrive(uint16_t networks) {
   String display_string;
   bool do_save;
   uint16_t new_unique_networks = 0;
+  uint16_t node_records = 0;
+  bool node_tx_failed = false;
 
   // ---- Chunk 4: load exclusion list once per scan cycle ----
   // Doing this outside the network loop avoids re-parsing the
@@ -1727,7 +1847,8 @@ uint16_t WiFiOps::processWardrive(uint16_t networks) {
           //display_obj.display_buffer->add(display_string);
         #endif
 
-        String wardrive_line = WiFi.BSSIDstr(i) + "," + ssid + "," + this->security_int_to_string(WiFi.encryptionType(i)) + "," + gps.getDatetime() + "," + (String)WiFi.channel(i) + "," + (String)WiFi.RSSI(i) + "," + gps.getLat() + "," + gps.getLon() + "," + gps.getAlt() + "," + gps.getAccuracy() + ",WIFI";
+        const uint16_t channel = WiFi.channel(i);
+        String wardrive_line = WiFi.BSSIDstr(i) + "," + ssid + "," + this->security_int_to_string(WiFi.encryptionType(i)) + "," + gps.getDatetime() + "," + (String)channel + "," + (String)wigleFrequencyMHz(channel) + "," + (String)WiFi.RSSI(i) + "," + gps.getLat() + "," + gps.getLon() + "," + gps.getAlt() + "," + gps.getAccuracy() + ",,0,WIFI";
         Logger::log(GUD_MSG, (String)this->mac_history_cursor + " | " + wardrive_line);
 
         if (this->run_mode == SOLO_MODE)
@@ -1750,16 +1871,26 @@ uint16_t WiFiOps::processWardrive(uint16_t networks) {
 
         String enow_line = WiFi.BSSIDstr(i) + "," + ssid + "," + this->security_int_to_string(WiFi.encryptionType(i)) + "," + (String)WiFi.channel(i) + "," + (String)WiFi.RSSI(i) + ",W";
         Logger::log(GUD_MSG, (String)this->mac_history_cursor + " | " + enow_line);
-        if (this->use_encryption)
-          this->sendEncryptedStringToCore(enow_line);
+        bool sent = this->use_encryption
+          ? this->sendEncryptedStringToCore(enow_line)
+          : this->sendBroadcastStringPlain(enow_line);
+        if (sent)
+          node_records++;
         else
-          this->sendBroadcastStringPlain(enow_line);
+          node_tx_failed = true;
       }
     }
   }
 
   if (this->run_mode == SOLO_MODE)
-    digitalWrite(LED_PIN, LOW);
+    digitalWrite(LED_PIN, LED_OFF);
+
+  if (this->run_mode == NODE_MODE) {
+    if (node_records > 0)
+      activity_led.scan(millis(), node_records);
+    if (node_tx_failed)
+      activity_led.tx_fail(millis());
+  }
 
   return new_unique_networks;
 }
@@ -1899,13 +2030,12 @@ void WiFiOps::startLog(String file_name) {
     false
   );
 
-  String header_line = "WigleWifi-1.4,appRelease=" + (String)FIRMWARE_VERSION +
+  String header_line = "WigleWifi-1.6,appRelease=" + (String)FIRMWARE_VERSION +
                        ",model=" + (String)DEVICE_NAME +
                        ",release=" + (String)FIRMWARE_VERSION +
                        ",device=" + (String)DEVICE_NAME +
-                       ",display=SPI TFT,board=ESP32-C5-DevKit,brand=JustCallMeKoko\n"
-                       "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,"
-                       "CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type";
+                       ",display=SPI TFT,board=ESP32-C5-DevKit,brand=JustCallMeKoko\n" +
+                       WIGLE_CSV_COLUMNS;
   buffer.append(header_line + "\n");
   Logger::log(GUD_MSG, "Log started: " + timestamped_name + ".log");
 }
@@ -2009,10 +2139,6 @@ bool WiFiOps::tryConnectToWiFi(unsigned long timeoutMs) {
 
   // Output status of connection attempt
   if (WiFi.status() == WL_CONNECTED) {
-    // Wall clock for wardrift.net ingest (sequence_no is ms-scaled and
-    // replay-checked against the key's own history). Reconfigure on every
-    // connect; harmless if called twice.
-    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
     display.clearScreen();
     display.tft->setCursor(0, 0);
     display.tft->print("Connected: ");
@@ -2031,16 +2157,68 @@ bool WiFiOps::tryConnectToWiFi(unsigned long timeoutMs) {
 }
 
 void WiFiOps::startAccessPoint() {
+  this->admin_ap_ssid = settings.loadSetting<String>(ADMIN_AP_SSID_NAME);
+  this->admin_ap_password = settings.loadSetting<String>(ADMIN_AP_PASS_NAME);
+  if (this->admin_ap_ssid.isEmpty()) {
+    this->admin_ap_ssid = "c5wardriver";
+    settings.saveSetting<bool>(ADMIN_AP_SSID_NAME, this->admin_ap_ssid);
+  }
+  if (this->admin_ap_password.isEmpty()) {
+    this->admin_ap_password = "c5wardriver";
+    settings.saveSetting<bool>(ADMIN_AP_PASS_NAME, this->admin_ap_password);
+  }
+  else if (this->admin_ap_password.length() < 8 || this->admin_ap_password.length() > 63) {
+    Logger::log(WARN_MSG, "Invalid saved admin AP password; using default");
+    this->admin_ap_password = "c5wardriver";
+  }
+
   display.clearScreen();
   display.tft->setCursor(0, 0);
   display.tft->print("Starting AP: ");
-  display.tft->println(this->apSSID);
-  WiFi.softAP(this->apSSID, this->apPassword);
+  display.tft->println(this->admin_ap_ssid);
+  WiFi.softAP(this->admin_ap_ssid.c_str(), this->admin_ap_password.c_str());
+  display.tft->print("Core MAC: ");
+  display.tft->println(this->getDeviceMacAddress());
   Logger::log(GUD_MSG, "Access Point started");
   Logger::log(GUD_MSG, "IP: ");
   Logger::log(GUD_MSG, WiFi.softAPIP().toString());
   display.tft->print("IP: ");
   display.tft->println(WiFi.softAPIP().toString());
+}
+
+bool WiFiOps::wardriftUpload(String filePath, const String& apiKeyOverride) {
+  display.clearScreen();
+  display.drawCenteredText("Wardrift upload...", true);
+  delay(100);
+
+  if (!SD.exists(filePath)) {
+    display.clearScreen();
+    display.drawCenteredText(filePath + " not found", true);
+    Logger::log(WARN_MSG, "[WARDRIFT] File not found: " + filePath);
+    return false;
+  }
+
+  String apiKey = apiKeyOverride;
+  if (apiKey.isEmpty())
+    apiKey = settings.loadSetting<String>(WARDRIFT_KEY_NAME);
+  if (apiKey.isEmpty()) {
+    display.clearScreen();
+    display.drawCenteredText("No wardrift key", true);
+    Logger::log(WARN_MSG, "[WARDRIFT] No API key configured");
+    return false;
+  }
+  Logger::log(STD_MSG, "[WARDRIFT] key " + apiKey.substring(0, 8) + "..." +
+              apiKey.substring(apiKey.length() >= 4 ? apiKey.length() - 4 : 0));
+
+  Logger::log(STD_MSG, "[WARDRIFT] Uploading: " + filePath);
+  bool ok = wardrift_client.uploadFile(filePath, apiKey);
+  if (ok) {
+    this->writeSidecar(filePath, "wardrift");
+    Logger::log(GUD_MSG, "[WARDRIFT] Upload succeeded");
+  } else {
+    Logger::log(WARN_MSG, "[WARDRIFT] Upload failed: " + wardrift_client.lastError());
+  }
+  return ok;
 }
 
 bool WiFiOps::wigleUpload(String filePath) {
@@ -2177,29 +2355,26 @@ bool WiFiOps::wigleUpload(String filePath) {
   fileToUpload.close();
 
 
-  // Read response
+  // Read response with a Content-Length early exit. The old loop always
+  // burned 5 s and logged "Timeout reached" even when the body had arrived.
   String response;
-  unsigned long timeout = millis();
-  while (millis() - timeout < 5000) {
-    while (client->available()) {
-      char c = client->read();
-      response += c;
-    }
-
-    delay(10);
-  }
-
-  if (millis() - timeout > 5000)
-    Logger::log(WARN_MSG, "Timeout reached");
-  if (!client->connected())
-    Logger::log(WARN_MSG, "Client disconnected");
-      
+  int http_status = readHttpResponse(*client, response, 10000);
   client->stop();
 
-  String respTrunc = response.length() > 200 ? response.substring(0, 200) : response;
-  Logger::log(STD_MSG, "[WIGLE] Response: " + respTrunc);
+  String respLog = response;
+  respLog.replace("\r", " ");
+  respLog.replace("\n", " ");
+  if (respLog.length() > 300) respLog = respLog.substring(0, 300);
+  Logger::log(STD_MSG, "[WIGLE] status=" + String(http_status) +
+              " body=" + respLog);
 
-  bool ok = response.indexOf("200 OK") >= 0;
+  bool body_false = response.indexOf("\"success\":false") >= 0 ||
+                    response.indexOf("\"success\": false") >= 0;
+  bool body_true  = response.indexOf("\"success\":true") >= 0 ||
+                    response.indexOf("\"success\": true") >= 0;
+  bool ok = (http_status == 200) && !body_false;
+  if (http_status == 200 && !body_true && !body_false)
+    Logger::log(WARN_MSG, "[WIGLE] 200 without a success verdict in body");
 
   display.clearScreen();
   display.drawCenteredText(ok ? "WIGLE OK" : "WIGLE Failed", true);
@@ -2216,6 +2391,22 @@ bool WiFiOps::wigleUpload(String filePath) {
 // filePath should include leading slash, e.g. "/wardrive.log"
 bool WiFiOps::sidecarExists(String filePath, String service) {
   return SD.exists(filePath + "." + service);
+}
+
+// A headers-only log can get a .wardrift sidecar from an older build that
+// treated sent=0 as success. If that log later fills, the sidecar would make
+// every uploader skip it. Prune sidecars attached to effectively empty logs.
+void WiFiOps::pruneEmptyWardriftSidecar(String filePath) {
+  String sidecarPath = filePath + ".wardrift";
+  if (!SD.exists(sidecarPath)) return;
+  File f = SD.open(filePath);
+  if (!f) return;
+  size_t size = f.size();
+  f.close();
+  if (size < 512) {
+    if (SD.remove(sidecarPath))
+      Logger::log(STD_MSG, "[UPLOAD] Removed stale empty-log sidecar: " + sidecarPath);
+  }
 }
 
 // Write a sidecar file recording the upload timestamp.
@@ -2322,28 +2513,25 @@ bool WiFiOps::wdgwarsUpload(String filePath) {
 
   Logger::log(STD_MSG, "[WDG] Bytes sent: " + String(totalSent));
 
-  // Read response
+  // Read response with a Content-Length early exit.
   String response;
-  unsigned long t = millis();
-  while (millis() - t < 5000) {
-    while (client->available()) {
-      char c = client->read();
-      response += c;
-    }
-    if (!client->connected() && !client->available())
-      break;
-
-    delay(10);
-  }
+  int http_status = readHttpResponse(*client, response, 10000);
   client->stop();
 
-  // Capture first 200 chars of response for log viewer
-  String respTrunc = response.length() > 200 ? response.substring(0, 200) : response;
-  Logger::log(STD_MSG, "[WDG] Response: " + respTrunc);
+  String respLog = response;
+  respLog.replace("\r", " ");
+  respLog.replace("\n", " ");
+  if (respLog.length() > 300) respLog = respLog.substring(0, 300);
+  Logger::log(STD_MSG, "[WDG] status=" + String(http_status) +
+              " body=" + respLog);
 
-  // WDG Wars returns 200 on success
-  bool ok = response.indexOf("202 Accepted") >= 0 ||
-  response.indexOf("\"ok\":true") >= 0;
+  bool body_ok = response.indexOf("\"ok\":true") >= 0 ||
+                 response.indexOf("\"ok\": true") >= 0;
+  bool already = response.indexOf("already") >= 0 ||
+                 response.indexOf("duplicate") >= 0 ||
+                 response.indexOf("exists") >= 0;
+  bool ok = (http_status == 202) || body_ok ||
+            (http_status == 409 && already);
 
   display.clearScreen();
   display.drawCenteredText(ok ? "WDG OK" : "WDG Failed", true);
@@ -2352,446 +2540,12 @@ bool WiFiOps::wdgwarsUpload(String filePath) {
   return ok;
 }
 
-// ============================================================
-// Chunk 3b: Wardrift.net upload
-// ============================================================
-// wardrift.net has TWO auth surfaces (verified live 2026-10-08 with a
-// real key):
-//   * /v1/wardrive/logs    — multipart file upload, session Bearer
-//     token only. A wardrive API key (wdk_...) 401s here on every
-//     header style. NOT usable by equipment.
-//   * /v1/ingest/signals   — JSON signal ingest, X-API-Key header.
-//     THIS is what wdk_ device keys authenticate against (confirmed:
-//     200 accepted with the real key; 401 with a bogus one).
-// The device therefore ingests individual signals: it parses the
-// local KISS CSV log and POSTs JSON batches of {ts,lat,lon,kind,
-// bssid,source_ts,rssi,ssid}. Sequence rules (from live probes + the
-// public wardrift-sync bridge):
-//   * envelope: {idempotency_key(UUID), sequence_no(int, strictly
-//     greater than the device's last accepted), device_ts(ISO),
-//     signature:"", items:[...]}
-//   * 409 sequence_replay  -> bump sequence_no, retry
-//   * 409 idempotency_key_reused -> fresh UUID, retry
-//   * item: {ts,lat,lon,kind:wifi|bluetooth,bssid,source_ts,rssi,
-//     ssid?,metadata:{source:"wardriver-c5"}}
-//   * batch of 100 items (reference bridge uses 250; 100 keeps the
-//     JSON under ~20 KB for 8MB-ESP32 heap headroom)
-#define WARDRIFT_HOST      "wardrift.net"
-#define WARDRIFT_INGEST    "/v1/ingest/signals"
-#define WARDRIFT_BATCH     100
-#define WARDRIFT_SEQ_FILE  "/wd_seq"
-
-// Load the persisted last-accepted sequence_no (SPIFFS, survives
-// reboot). Returns 0 if none yet.
-static uint64_t wardriftLoadSeq() {
-  File f = SPIFFS.open(WARDRIFT_SEQ_FILE, FILE_READ);
-  if (!f) return 0;
-  uint64_t v = 0;
-  for (int i = 0; i < 8; i++) {
-    int c = f.read();
-    if (c < 0) break;
-    v |= (uint64_t)(uint8_t)c << (8 * i);
-  }
-  f.close();
-  return v;
-}
-
-static void wardriftSaveSeq(uint64_t v) {
-  File f = SPIFFS.open(WARDRIFT_SEQ_FILE, FILE_WRITE);
-  if (!f) {
-    Logger::log(WARN_MSG, "[WARDRIFT] Could not persist sequence");
-    return;
-  }
-  for (int i = 0; i < 8; i++)
-    f.write((uint8_t)((v >> (8 * i)) & 0xFF));
-  f.close();
-}
-
-// One random UUIDv4 (random() is seeded by the Arduino core from the
-// RNG at boot). UUID-shaped hex required by the server's parser.
-static String wardriftUuid() {
-  char h[33];
-  for (int i = 0; i < 32; i++) {
-    int n = random(0, 16);
-    h[i] = (n < 10) ? ('0' + n) : ('a' + n - 10);
-  }
-  h[32] = 0;
-  String u = String(h);
-  return u.substring(0, 8) + "-" + u.substring(8, 12) + "-" +
-         u.substring(12, 16) + "-" + u.substring(16, 20) + "-" +
-         u.substring(20, 32);
-}
-
-// Civil-date to Unix epoch (Howard Hinnant's days_from_civil).
-// Pure arithmetic, no libc mktime / no TZ assumptions. Returns 0 on
-// nonsense input.
-static uint64_t wardriftEpoch(int y, int mo, int d, int h, int mi, int se) {
-  if (y < 1970 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31)
-    return 0;
-  long yy = y - (mo <= 2 ? 1 : 0);
-  long era = (yy >= 0 ? yy : yy - 399) / 400;
-  long yoe = yy - era * 400;
-  long mp = (mo + 9) % 12;
-  long doy = (153 * mp + 2) / 5 + d - 1;
-  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  long days = era * 146097 + doe - 719468;
-  return (uint64_t)(days * 86400LL + h * 3600LL + mi * 60LL + se);
-}
-
-// Parse "YYYY-M-D H:MM:SS" (GPS datetime, possibly unpadded) into a
-// Unix epoch. Returns 0 on garbage.
-static uint64_t wardriftEpochFromGps(String s) {
-  int y, mo, d, h, mi, se;
-  if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6)
-    return 0;
-  return wardriftEpoch(y, mo, d, h, mi, se);
-}
-
-// Wall-clock epoch in MILLISECONDS from NTP (0 if NTP never synced —
-// wardriftUpload() falls back to the persisted floor, which is safe:
-// a stale seq costs at most one sequence_replay retry).
-static uint64_t wardriftNowEpochMs() {
-  int32_t t = time(nullptr);
-  return (t > 0) ? (uint64_t)t * 1000ULL : 0ULL;
-}
-
-// Parse "YYYY-M-D H:MM:SS" (GPS datetime, possibly unpadded) into
-// ISO 8601 "YYYY-MM-DDTHH:MM:SSZ". Returns "" on garbage.
-static String wardriftIso(String s) {
-  int y, mo, d, h, mi, se;
-  if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6)
-    return "";
-  if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31)
-    return "";
-  char out[24];
-  snprintf(out, sizeof(out), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-           y, mo, d, h, mi, se);
-  return String(out);
-}
-
-// Send one JSON batch to /v1/ingest/signals. Two retry paths:
-// sequence_replay -> next seq; idempotency_key_reused -> fresh UUID.
-// Returns true on accepted/duplicate (both are fine for us).
-// wardrift.net rejects sequence_no <= the device's last accepted
-// value (stale/replay). Gaps are fine, so on stale/replay we jump to
-// the current row's GPS epoch + 2 — always greater than any history
-// this key could have. (millis() is uptime, not epoch — never use it
-// here. device_ts is ISO from the GPS row, not wall-clock.)
-bool WiFiOps::wardriftSendBatch(String apiKey, String itemsJson,
-                                uint64_t &seq, String deviceTs,
-                                uint64_t rowEpoch, String &lastErr) {
-  String idem = wardriftUuid();
-
-  auto buildBody = [&]() -> String {
-    String b;
-    b.reserve(itemsJson.length() + 220);
-    b = "{\"idempotency_key\":\"";
-    b += idem;
-    b += "\",\"sequence_no\":";
-    b += String(seq);
-    b += ",\"device_ts\":\"";
-    b += deviceTs;
-    b += "\",\"signature\":\"\",\"items\":";
-    b += itemsJson;
-    b += "}";
-    return b;
-  };
-  String body = buildBody();
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    if (!client->connected() &&
-        !client->connect(WARDRIFT_HOST, 443)) {
-      // Transient STA/TLS drop. Waiting for the STA and re-sending the
-      // SAME body (idem + seq unchanged) is safe: the server either got
-      // nothing (accepts the resend) or already accepted it (returns
-      // duplicate:true, which counts as success).
-      lastErr = "connect fail";
-      client->stop();
-      if (attempt == 3)
-        return false;
-      Logger::log(WARN_MSG, "[WARDRIFT] Connect fail (try " +
-                  String(attempt + 1) + "/4), waiting for WiFi...");
-      unsigned long t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
-        delay(100);
-      delay(1500);
-      continue;
-    }
-    client->println("POST " WARDRIFT_INGEST " HTTP/1.1");
-    client->println("Host: " WARDRIFT_HOST);
-    client->println("User-Agent: ESP32Wardriver/1.0");
-    client->println("Accept: application/json");
-    client->println("X-API-Key: " + apiKey);
-    client->println("Content-Type: application/json");
-    client->print("Content-Length: ");
-    client->println(body.length());
-    client->println();
-    client->print(body);
-    client->flush();
-
-    String response;
-    unsigned long t = millis();
-    while (millis() - t < 5000) {
-      while (client->available())
-        response += (char)client->read();
-      if (!client->connected() && !client->available())
-        break;
-      delay(10);
-    }
-
-    String respTrunc = response.length() > 300 ?
-      response.substring(0, 300) : response;
-    Logger::log(STD_MSG, "[WARDRIFT] Batch " + String(seq) + " (" +
-              String(itemsJson.length()) + " B): " + respTrunc);
-
-    if (response.indexOf("\"accepted\":true") >= 0 ||
-        response.indexOf("\"duplicate\":true") >= 0) {
-      wardriftSaveSeq(seq);
-      client->stop();
-      return true;
-    }
-
-    bool retryable = false;
-    if (response.isEmpty()) {
-      // No response: TLS dropped mid-send. Re-sending the SAME body
-      // (idem + seq unchanged) is safe (accepted or duplicate:true).
-      retryable = true;
-      lastErr = "no response";
-    } else if (response.indexOf("sequence_replay") >= 0 ||
-        response.indexOf("stale") >= 0) {
-      // Jump past this device's own history: wall-clock NOW in ms + 2s.
-      // (Row GPS time can be OLDER than what this key has already been
-      // accepted with — e.g. re-driving an old route — so the row epoch
-      // is not a safe high-water mark.) Gaps are allowed, only stale
-      // values are rejected.
-      seq = wardriftNowEpochMs() + 2000;
-      body = buildBody();  // new seq baked in
-      retryable = true;
-      lastErr = "sequence_replay -> " + String(seq);
-    } else if (response.indexOf("idempotency_key_reused") >= 0) {
-      idem = wardriftUuid();
-      body = buildBody();  // new UUID baked in
-      retryable = true;
-      lastErr = "idempotency reused";
-    }
-
-    if (!retryable || attempt == 1) {
-      client->stop();
-      if (lastErr == "" || lastErr == "sequence_replay" ||
-          lastErr == "idempotency reused")
-        lastErr = "rejected: " + respTrunc.substring(0, 120);
-      return false;
-    }
-  }
-  return false;
-}
-
-// Parse the KISS CSV at filePath and ingest its rows to wardrift.net
-// via POST /v1/ingest/signals (X-API-Key auth, JSON batches).
-//
-// CSV layout written by startLog/scan:
-//   line 1:  "WigleWifi-1.4,..." meta header  (skipped)
-//   line 2:  "MAC,SSID,AuthMode,FirstSeen,..." column header (skipped)
-//   line 3+: "AA:BB:..:FF,SSID,AUTH,YYYY-M-D H:MM:SS,CH,RSSI,LAT,LON,ALT,ACC,WIFI|BLE"
-// Rows without a valid MAC or lat/lon are skipped (wardrift rejects
-// invalid_mac / non_fixed anyway). Returns true when every batch was
-// accepted (or flagged duplicate) by the server.
-bool WiFiOps::wardriftUpload(String filePath) {
-  display.clearScreen();
-  display.drawCenteredText("Wardrift Ingest...", true);
-  delay(100);
-
-  if (!SD.exists(filePath)) {
-    display.drawCenteredText(filePath + " not found", true);
-    Logger::log(WARN_MSG, "[WARDRIFT] File not found: " + filePath);
-    return false;
-  }
-
-  String apiKey = settings.loadSetting<String>(WARDRIFT_KEY_NAME);
-  if (apiKey.isEmpty()) {
-    display.clearScreen();
-    display.drawCenteredText("No wardrift API key", true);
-    Logger::log(WARN_MSG, "[WARDRIFT] No wardrift.net API key configured (Settings page)");
-    return false;
-  }
-
-  File f = SD.open(filePath);
-  if (!f) {
-    display.drawCenteredText("Open fail", true);
-    Logger::log(WARN_MSG, "[WARDRIFT] Could not open: " + filePath);
-    return false;
-  }
-
-  // sequence_no is MILLISECONDS and must exceed this key's own last
-  // accepted value. Use NTP wall-clock as the high-water mark: it is
-  // always newer than anything this key has historically ingested.
-  // (Uploads only happen while STA-connected, so NTP can sync.)
-  for (int i = 0; i < 20 && time(nullptr) <= 0; i++)
-    delay(500);
-  uint64_t nowMs = wardriftNowEpochMs();
-  if (nowMs == 0) {
-    display.clearScreen();
-    display.drawCenteredText("No NTP time", true);
-    delay(1000);
-    Logger::log(WARN_MSG, "[WARDRIFT] NTP not synced - cannot sequence");
-    return false;
-  }
-  uint64_t seq = wardriftLoadSeq();
-  if (seq < 1700000000000ULL)  // sane epoch floor in MILLISECONDS (2023-11)
-    seq = 1700000000000ULL;
-  if (nowMs > seq)             // wall clock wins: strictly past all history
-    seq = nowMs;
-  seq += 1000;                // strictly greater than anything this key has
-                              // already accepted (avoids an immediate replay
-                              // on the very first batch of a re-run)
-
-  uint64_t batchEpoch = 0;  // GPS epoch of first row in current batch
-  String   batchIso;        // ISO form of the same, used as device_ts
-
-  String items;          // JSON array body (grows across batches)
-  int    itemsCount = 0; // rows in current batch
-  int    totalSent = 0, totalSkipped = 0;
-  bool   hadError = false;
-  String lastErr;
-  bool   firstLine = true;
-  int    lineNo = 0;
-
-  client->setInsecure();
-  client->setTimeout(5000);
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    lineNo++;
-    line.trim();
-    if (line.isEmpty())
-      continue;
-    if (firstLine) {           // "WigleWifi-1.4,..." or a bare header line
-      firstLine = false;
-      if (line.startsWith("MAC,") || line.startsWith("WigleWifi"))
-        continue;
-    }
-
-    // MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,Lat,Lon,Alt,Acc,Type
-    char  macB[18],  ssidB[40],  authB[12], tsB[24];
-    char  chB[8],    rssiB[8],   latB[20],  lonB[20];
-    char  altB[14],  accB[14],   typeB[8];
-    int n = sscanf(line.c_str(),
-      "%17[^,],%39[^,],%11[^,],%23[^,],%7[^,],%7[^,],%19[^,],%19[^,],%13[^,],%13[^,],%7s",
-      macB, ssidB, authB, tsB, chB, rssiB, latB, lonB, altB, accB, typeB);
-    if (n != 11) { totalSkipped++; continue; }
-
-    String mac = macB;  mac.trim();
-    String lat = latB;  lat.trim();
-    String lon = lonB;  lon.trim();
-    String ts  = tsB;   ts.trim();
-    String typ = typeB; typ.trim();
-    String ssid = ssidB; ssid.trim();
-
-    // Validate MAC (12 hex digits / colons present)
-    int hexc = 0;
-    for (int i = 0; i < (int)mac.length(); i++)
-      if (isxdigit((unsigned char)mac[i])) hexc++;
-    if (hexc < 12) { totalSkipped++; continue; }
-    mac.toLowerCase();
-
-    float la = lat.toFloat();
-    float lo = lon.toFloat();
-    if (la < -90.0f || la > 90.0f || lo < -180.0f || lo > 180.0f) {
-      totalSkipped++; continue;
-    }
-
-    String kind = typ.equalsIgnoreCase("BLE") ? "bluetooth" : "wifi";
-    uint64_t rowEpoch = wardriftEpochFromGps(ts);
-    String iso  = wardriftIso(ts);
-    int rssi = atoi(rssiB);
-    if (itemsCount == 0) {            // first row of the batch sets its clock
-      batchEpoch = (rowEpoch != 0) ? rowEpoch : seq;
-      batchIso   = iso;               // "" if this row has no GPS
-      if (batchIso.isEmpty())
-        batchIso = "1970-01-01T00:00:00Z";   // device_ts must be valid ISO
-    }
-    if (iso.isEmpty())
-      iso = batchIso;                 // reuse the batch's clock
-
-    if (itemsCount > 0)
-      items += ",";
-    items += "{\"ts\":\"";      items += iso;
-    items += "\",\"lat\":";     items += String(la, 7);
-    items += ",\"lon\":";       items += String(lo, 7);
-    items += ",\"kind\":\"";    items += kind;
-    items += "\",\"bssid\":\""; items += mac;
-    items += "\",\"source_ts\":\""; items += iso;
-    if (ssid.length() > 0 && ssid.length() < 60) {
-      // Escape embedded quotes/backslashes minimally. A comma in the
-      // SSID would already have broken the row's field count and
-      // skipped it above.
-      items += "\",\"ssid\":\"";
-      for (unsigned int i = 0; i < ssid.length(); i++) {
-        char c = ssid[i];
-        if (c == '"' || c == '\\') items += '\\';
-        if (c >= 32) items += c;
-      }
-      items += '"';
-    }
-    items += ",\"rssi\":";     items += String(rssi);
-    items += ",\"metadata\":{\"source\":\"wardriver-c5\"}}";
-    itemsCount++;
-
-    if (itemsCount >= WARDRIFT_BATCH) {
-      String arr = "[" + items + "]";
-      if (!wardriftSendBatch(apiKey, arr, seq, batchIso, batchEpoch, lastErr)) {
-        hadError = true;
-        f.close();
-        display.clearScreen();
-        display.drawCenteredText("Wardrift batch fail", true);
-        delay(1000);
-        Logger::log(WARN_MSG, "[WARDRIFT] Batch failed at row " +
-                      String(lineNo) + ": " + lastErr);
-        return false;
-      }
-      totalSent += itemsCount;
-      seq += 1000; // next batch must be strictly greater than the accepted one (ms scale)
-      items = "";
-      itemsCount = 0;
-      display.tft->setCursor(0, (TFT_HEIGHT / 3) * 2);
-      display.drawCenteredText(String(totalSent) + " sent", false);
-    }
-  }
-  f.close();
-
-  if (itemsCount > 0) {
-    String arr = "[" + items + "]";
-    if (!wardriftSendBatch(apiKey, arr, seq, batchIso, batchEpoch, lastErr)) {
-      hadError = true;
-      display.clearScreen();
-      display.drawCenteredText("Wardrift batch fail", true);
-      delay(1000);
-      Logger::log(WARN_MSG, "[WARDRIFT] Final batch failed: " + lastErr);
-      return false;
-    }
-    totalSent += itemsCount;
-  }
-
-  Logger::log(GUD_MSG, "[WARDRIFT] Done. sent=" + String(totalSent) +
-              " skipped=" + String(totalSkipped));
-
-  display.clearScreen();
-  display.drawCenteredText("Wardrift OK " + String(totalSent), true);
-  delay(1000);
-
-  // Success requires real ingested rows. A file whose rows all
-  // lack GPS (or whose batches were all rejected) is a failure,
-  // not an 'OK 0'.
-  return !hadError && totalSent > 0;
-}
-
-// Upload a single file to one or more services.
-// upload_type: WIGLE_UPLOAD, WDG_UPLOAD, WARDRIFT_UPLOAD, or BOTH_UPLOAD.
-// BOTH = WiGLE + WDG Wars + wardrift.net (all three).
+// Upload a single file to one or more services (WiGLE, WDG Wars, wardrift.net).
 // Skips any service that already has a sidecar, unless retry=true.
 // Writes sidecar for each service that succeeds.
-// Returns true if every selected service succeeds (or was already done).
-bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type) {
+// Returns true only if every requested service succeeded (or was already done).
+bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type,
+                         UploadOutcome* outcome) {
   display.clearScreen();
   display.drawCenteredText("Uploading " + filePath, true);
   delay(1000);
@@ -2799,15 +2553,26 @@ bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type) {
   Logger::log(STD_MSG, "[UPLOAD] uploadFile: " + filePath +
               (retry ? " (retry)" : ""));
 
-  bool wigle_already  = !retry && this->sidecarExists(filePath, "wigle");
-  bool wdg_already    = !retry && this->sidecarExists(filePath, "wdg");
-  bool wardrift_already = !retry && this->sidecarExists(filePath, "wardrift");
+  this->pruneEmptyWardriftSidecar(filePath);
 
-  bool wigle_ok    = wigle_already;
-  bool wdg_ok      = wdg_already;
-  bool wardrift_ok = wardrift_already;
+  bool wigle_already = !retry && this->sidecarExists(filePath, "wigle");
+  bool wdg_already   = !retry && this->sidecarExists(filePath, "wdg");
+  bool wd_already    = !retry && this->sidecarExists(filePath, "wardrift");
 
-  if ((upload_type == WIGLE_UPLOAD) || (upload_type == BOTH_UPLOAD)) {
+  bool want_wigle = (upload_type == WIGLE_UPLOAD) ||
+                    (upload_type == BOTH_UPLOAD) ||
+                    (upload_type == ALL_UPLOAD);
+  bool want_wdg   = (upload_type == WDG_UPLOAD) ||
+                    (upload_type == BOTH_UPLOAD) ||
+                    (upload_type == ALL_UPLOAD);
+  bool want_wd    = (upload_type == WARDRIFT_UPLOAD) ||
+                    (upload_type == ALL_UPLOAD);
+
+  bool wigle_ok = wigle_already;
+  bool wdg_ok   = wdg_already;
+  bool wd_ok    = wd_already;
+
+  if (want_wigle) {
     if (!wigle_already) {
       Logger::log(STD_MSG, "[UPLOAD] Uploading to WiGLE: " + filePath);
       wigle_ok = this->wigleUpload(filePath);
@@ -2822,7 +2587,7 @@ bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type) {
     }
   }
 
-  if ((upload_type == WDG_UPLOAD) || (upload_type == BOTH_UPLOAD)) {
+  if (want_wdg) {
     if (!wdg_already) {
       Logger::log(STD_MSG, "[UPLOAD] Uploading to WDG Wars: " + filePath);
       wdg_ok = this->wdgwarsUpload(filePath);
@@ -2837,11 +2602,11 @@ bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type) {
     }
   }
 
-  if ((upload_type == WARDRIFT_UPLOAD) || (upload_type == BOTH_UPLOAD)) {
-    if (!wardrift_already) {
+  if (want_wd) {
+    if (!wd_already) {
       Logger::log(STD_MSG, "[UPLOAD] Uploading to wardrift.net: " + filePath);
-      wardrift_ok = this->wardriftUpload(filePath);
-      if (wardrift_ok) {
+      wd_ok = this->wardriftUpload(filePath);
+      if (wd_ok) {
         this->writeSidecar(filePath, "wardrift");
         Logger::log(GUD_MSG, "[UPLOAD] wardrift.net upload succeeded");
       } else {
@@ -2852,15 +2617,18 @@ bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type) {
     }
   }
 
-  if (upload_type == WIGLE_UPLOAD)
-    return wigle_ok;
-  else if (upload_type == WDG_UPLOAD)
-    return wdg_ok;
-  else if (upload_type == WARDRIFT_UPLOAD)
-    return wardrift_ok;
-  else if (upload_type == BOTH_UPLOAD)
-    return wigle_ok && wdg_ok && wardrift_ok;
-  
+  if (outcome) {
+    outcome->wigle    = want_wigle && wigle_ok;
+    outcome->wdg      = want_wdg && wdg_ok;
+    outcome->wardrift = want_wd && wd_ok;
+  }
+
+  if (upload_type == WIGLE_UPLOAD)    return wigle_ok;
+  if (upload_type == WDG_UPLOAD)      return wdg_ok;
+  if (upload_type == WARDRIFT_UPLOAD) return wd_ok;
+  if (upload_type == BOTH_UPLOAD)     return wigle_ok && wdg_ok;
+  if (upload_type == ALL_UPLOAD)      return wigle_ok && wdg_ok && wd_ok;
+
   return false;
 }
 
@@ -2890,25 +2658,15 @@ void WiFiOps::uploadAllPending() {
       String name = f.name();
       if (name.endsWith(".log") && name != "debug.log") {
         String path = "/" + name;
-        bool wigle_done    = this->sidecarExists(path, "wigle");
-        bool wdg_done      = this->sidecarExists(path, "wdg");
-        bool wardrift_done = this->sidecarExists(path, "wardrift");
+        bool wigle_done = this->sidecarExists(path, "wigle");
+        bool wdg_done   = this->sidecarExists(path, "wdg");
+        bool wd_done    = this->sidecarExists(path, "wardrift");
 
-        if (wigle_done && wdg_done && wardrift_done) {
+        if (wigle_done && wdg_done && wd_done) {
           skipped++;
         } else {
           Logger::log(STD_MSG, "[UPLOAD] Pending: " + path);
-          bool wigle_needed    = !wigle_done;
-          bool wdg_needed      = !wdg_done;
-          bool wardrift_needed = !wardrift_done;
-          bool ok = this->uploadFile(path, false, BOTH_UPLOAD);
-          // Count as uploaded if all needed services succeeded
-          bool wigle_now    = this->sidecarExists(path, "wigle");
-          bool wdg_now      = this->sidecarExists(path, "wdg");
-          bool wardrift_now = this->sidecarExists(path, "wardrift");
-          bool fully_done = (!wigle_needed || wigle_now) &&
-                            (!wdg_needed || wdg_now) &&
-                            (!wardrift_needed || wardrift_now);
+          bool fully_done = this->uploadFile(path, false, ALL_UPLOAD);
           if (fully_done) uploaded++;
           else            failed++;
         }
@@ -2955,9 +2713,12 @@ void WiFiOps::serveConfigPage() {
     String cur_wdg_key     = settings.loadSetting<String>(WDG_KEY_NAME);
     String cur_wd_key      = settings.loadSetting<String>(WARDRIFT_KEY_NAME);
     String cur_t_ssid      = settings.loadSetting<String>(TRIGGER_SSID_NAME);
+    String cur_admin_ap_ssid = settings.loadSetting<String>(ADMIN_AP_SSID_NAME);
+    String cur_core_mac = settings.loadSetting<String>(CORE_MAC_NAME);
     bool   cur_dbg_en      = settings.loadSetting<bool>(DEBUG_LOG_NAME);
     int    cur_mode        = settings.loadSetting<int>("m");
     bool   cur_enc         = settings.loadSetting<bool>("e");
+    const String device_mac = this->getDeviceMacAddress();
 
     String html = "<html><body>";
     html += "<h2>JCMK C5 Wardriver &mdash; Configuration</h2>";
@@ -2966,8 +2727,8 @@ void WiFiOps::serveConfigPage() {
     // ---- Network ----
     html += "<h3>Network</h3>";
     html += "<small>Network to connect at boot for web UI access (e.g. home WiFi) - separate from Trigger SSID</small><br><br>";
-    html += "AP SSID: <input type=\"text\" name=\"ssid\" value=\"" + cur_ssid + "\"><br>";
-    html += "AP Password: <input type=\"password\" name=\"password\" placeholder=\"leave blank to keep\"><br>";
+    html += "WiFi SSID: <input type=\"text\" name=\"ssid\" value=\"" + cur_ssid + "\"><br>";
+    html += "WiFi Password: <input type=\"password\" name=\"password\" placeholder=\"leave blank to keep\"><br>";
 
     // ---- WiGLE ----
     html += "<h3>WiGLE</h3>";
@@ -2980,9 +2741,9 @@ void WiFiOps::serveConfigPage() {
     if (!cur_wdg_key.isEmpty()) html += " <em>(key saved)</em>";
     html += "<br>";
 
-    // ---- Wardrift.net ----
-    html += "<h3>Wardrift.net</h3>";
-    html += "<small>Create an API key at wardrift.net (Dashboard &rarr; API Keys, device type wardrive).</small><br>";
+    // ---- wardrift.net ----
+    html += "<h3>wardrift.net</h3>";
+    html += "<small>Device API key (wdk_...) from the wardrift.net dashboard. Signals are ingested as individual WiFi/BLE observations with GPS.</small><br><br>";
     html += "API Key: <input type=\"password\" name=\"wd_key\" placeholder=\"leave blank to keep\">";
     if (!cur_wd_key.isEmpty()) html += " <em>(key saved)</em>";
     html += "<br>";
@@ -2990,7 +2751,7 @@ void WiFiOps::serveConfigPage() {
     // ---- Dock Mode ----
     html += "<h3>Dock Mode</h3>";
     html += "<small>The trigger SSID (e.g. K1T or a phone hotspot) causes the wardriver to pause, ";
-    html += "connect, and upload all pending logs to WiGLE and WDG Wars.</small><br><br>";
+    html += "connect, and upload all pending logs to WiGLE, WDG Wars, and wardrift.net.</small><br><br>";
     html += "Trigger SSID: <input type=\"text\" name=\"trigger_ssid\" value=\"" + cur_t_ssid + "\"><br>";
     html += "Trigger Password: <input type=\"password\" name=\"trigger_pass\" placeholder=\"leave blank to keep\"><br>";
 
@@ -2999,6 +2760,10 @@ void WiFiOps::serveConfigPage() {
     html += "<small>Setting a password enables Basic Auth on the web UI. ";
     html += "Recommended when using dock mode web server on a shared network.</small><br><br>";
     html += "Admin Password: <input type=\"password\" name=\"admin_pass\" placeholder=\"leave blank to keep current\"><br>";
+    html += "<h4>Admin Access Point</h4>";
+    html += "<small>Used when the saved WiFi network is unavailable. Password must be 8-63 characters.</small><br><br>";
+    html += "AP SSID: <input type=\"text\" name=\"admin_ap_ssid\" maxlength=\"32\" value=\"" + cur_admin_ap_ssid + "\"><br>";
+    html += "AP Password: <input type=\"password\" name=\"admin_ap_pass\" minlength=\"8\" maxlength=\"63\" placeholder=\"leave blank to keep current\"><br>";
     html += "<br>SD Debug Log: <input type=\"checkbox\" name=\"dbg_en\" value=\"true\"";
     if (cur_dbg_en) html += " checked";
     html += "> <small>Write all log entries to " + String(DEBUG_LOG_FILE) + " on SD card</small><br>";
@@ -3055,6 +2820,10 @@ void WiFiOps::serveConfigPage() {
     html += "<input type=\"radio\" name=\"device_mode\" value=\"solo\"" + String(cur_mode == SOLO_MODE ? " checked" : "") + "> Solo<br>";
     html += "<input type=\"radio\" name=\"device_mode\" value=\"core\"" + String(cur_mode == CORE_MODE ? " checked" : "") + "> Core<br>";
     html += "<input type=\"radio\" name=\"device_mode\" value=\"node\"" + String(cur_mode == NODE_MODE ? " checked" : "") + "> Node<br><br>";
+    html += "<strong>This Device / Core MAC:</strong> <code>" + device_mac + "</code><br>";
+    html += "<small>Enter this address on each Node that should bind to this device.</small><br><br>";
+    html += "Bound Core MAC: <input type=\"text\" name=\"core_mac\" value=\"" + cur_core_mac + "\" placeholder=\"AA:BB:CC:DD:EE:FF\" pattern=\"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}\"><br>";
+    html += "<small>Used in Node mode to prevent communication with any other Core. Leave blank in Solo/Core mode.</small><br><br>";
 
     // ---- Encryption ----
     html += "<h3>Encryption (ESP-NOW)</h3>";
@@ -3068,6 +2837,11 @@ void WiFiOps::serveConfigPage() {
 
     // ---- Files on SD Card ----
     html += "<h2>Files on SD Card</h2>";
+    if (this->connected_as_client) {
+      html += "<a href=\"/deleteall\" onclick=\"return confirm('Delete every wardrive log except the active log and debug.log? This includes logs that have not been uploaded.');\">Delete All Logs</a>";
+      html += " &nbsp; <a href=\"/deleteall?mode=uploaded\" onclick=\"return confirm('Delete only logs that already have WiGLE, WDG, and Wardrift markers?');\">Delete Uploaded Only</a>";
+      html += " &nbsp; <small>All keeps the active log and debug.log.</small><br><br>";
+    }
     File root = SD.open("/");
     if (root && root.isDirectory()) {
       File file = root.openNextFile();
@@ -3076,9 +2850,9 @@ void WiFiOps::serveConfigPage() {
           String filename = file.name();
           if (filename.endsWith(".log") && filename != "debug.log") {
             // Check sidecar upload status
-            bool wigleDone    = SD.exists("/" + filename + ".wigle");
-            bool wdgDone      = SD.exists("/" + filename + ".wdg");
-            bool wardriftDone = SD.exists("/" + filename + ".wardrift");
+            bool wigleDone = SD.exists("/" + filename + ".wigle");
+            bool wdgDone   = SD.exists("/" + filename + ".wdg");
+            bool wdDone    = SD.exists("/" + filename + ".wardrift");
 
             html += "<a href=\"/download?file=" + filename + "\">" + filename + "</a> ";
             html += String(file.size()) + " B";
@@ -3095,22 +2869,29 @@ void WiFiOps::serveConfigPage() {
               else
                 html += " | <em>WDG&check;</em>";
 
-              if (!wardriftDone)
+              if (!wdDone)
                 html += " | <a href=\"/upload?file=" + filename + "&svc=wardrift\">Upload Wardrift</a>";
               else
                 html += " | <em>Wardrift&check;</em>";
 
-              // Retry link if either failed
-              if (wigleDone && wdgDone && wardriftDone)
-                html += " | <a href=\"/upload?file=" + filename + "&svc=both&retry=1\">Retry All</a>";
-              else if (!wigleDone || !wdgDone || !wardriftDone)
-                html += " | <a href=\"/upload?file=" + filename + "&svc=both\">Upload All</a>";
+              // One action for every service.
+              bool allDone = wigleDone && wdgDone && wdDone;
+              if (allDone)
+                html += " | <em>All&check;</em>";
+              else
+                html += " | <a href=\"/upload?file=" + filename + "&svc=all\">Upload All</a>";
+
+              html += " | <a href=\"/delete?file=" + filename +
+                      "\" onclick=\"return confirm('Delete this file and its upload markers?');\">Delete</a>";
             }
             html += "<br>";
-          } else if (!filename.endsWith(".wigle") && !filename.endsWith(".wdg") && !filename.endsWith(".wardrift")) {
+          } else if (!filename.endsWith(".wigle") && !filename.endsWith(".wdg") &&
+                     !filename.endsWith(".wardrift")) {
             // Show non-log, non-sidecar files for download only
             html += "<a href=\"/download?file=" + filename + "\">" + filename + "</a> ";
-            html += String(file.size()) + " B<br>";
+            html += String(file.size()) + " B";
+            html += " | <a href=\"/delete?file=" + filename +
+                    "\" onclick=\"return confirm('Delete this file?');\">Delete</a><br>";
           }
         }
         file = root.openNextFile();
@@ -3130,6 +2911,29 @@ void WiFiOps::serveConfigPage() {
     this->last_web_client_activity = millis();
 
     bool anyChange = false;
+
+    if (server.hasArg("admin_ap_ssid")) {
+      String candidate = server.arg("admin_ap_ssid");
+      candidate.trim();
+      if (candidate.isEmpty() || candidate.length() > 32) {
+        server.send(400, "text/html", "<html><body><h3>Invalid admin AP SSID.</h3><p>SSID must be 1-32 characters.</p><a href=\"/\">Back</a></body></html>");
+        return;
+      }
+    }
+    if (server.hasArg("admin_ap_pass") && !server.arg("admin_ap_pass").isEmpty()) {
+      const size_t length = server.arg("admin_ap_pass").length();
+      if (length < 8 || length > 63) {
+        server.send(400, "text/html", "<html><body><h3>Invalid admin AP password.</h3><p>Password must be 8-63 characters.</p><a href=\"/\">Back</a></body></html>");
+        return;
+      }
+    }
+    if (server.hasArg("core_mac") && !server.arg("core_mac").isEmpty()) {
+      uint8_t parsed_core[6];
+      if (!parseCoreMac(server.arg("core_mac").c_str(), parsed_core)) {
+        server.send(400, "text/html", "<html><body><h3>Invalid Core MAC.</h3><p>Use AA:BB:CC:DD:EE:FF format and a unicast MAC.</p><a href=\"/\">Back</a></body></html>");
+        return;
+      }
+    }
 
     // Validate every geofence before mutating settings. Empty slots are valid,
     // but once any field is provided the radius must satisfy the documented rule.
@@ -3175,6 +2979,17 @@ void WiFiOps::serveConfigPage() {
       anyChange = true;
     }
 
+    if (server.hasArg("admin_ap_ssid")) {
+      String candidate = server.arg("admin_ap_ssid");
+      candidate.trim();
+      settings.saveSetting<bool>(ADMIN_AP_SSID_NAME, candidate);
+      anyChange = true;
+    }
+    if (server.hasArg("admin_ap_pass") && !server.arg("admin_ap_pass").isEmpty()) {
+      settings.saveSetting<bool>(ADMIN_AP_PASS_NAME, server.arg("admin_ap_pass"));
+      anyChange = true;
+    }
+
     // WiGLE
     if (server.hasArg("wigle_user") && server.arg("wigle_user") != "") {
       this->wigle_user = server.arg("wigle_user");
@@ -3192,8 +3007,6 @@ void WiFiOps::serveConfigPage() {
       settings.saveSetting<bool>(WDG_KEY_NAME, server.arg("wdg_key"));
       anyChange = true;
     }
-
-    // Wardrift.net
     if (server.hasArg("wd_key") && server.arg("wd_key") != "") {
       settings.saveSetting<bool>(WARDRIFT_KEY_NAME, server.arg("wd_key"));
       anyChange = true;
@@ -3282,6 +3095,22 @@ void WiFiOps::serveConfigPage() {
       anyChange = true;
     }
 
+    if (server.hasArg("core_mac")) {
+      String candidate = server.arg("core_mac");
+      candidate.trim();
+      if (candidate.isEmpty()) {
+        settings.saveSetting<bool>(CORE_MAC_NAME, "");
+      }
+      else {
+        uint8_t parsed_core[6];
+        char normalized_core[18];
+        parseCoreMac(candidate.c_str(), parsed_core);
+        formatCoreMac(parsed_core, normalized_core);
+        settings.saveSetting<bool>(CORE_MAC_NAME, String(normalized_core));
+      }
+      anyChange = true;
+    }
+
     // Encryption
     if (server.hasArg("enow_key") && server.arg("enow_key") != "") {
       this->esp_now_key = server.arg("enow_key");
@@ -3335,6 +3164,118 @@ void WiFiOps::serveConfigPage() {
     downloadFile.close();
   });
 
+  server.on("/delete", HTTP_GET, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+
+    if (!server.hasArg("file")) {
+      server.send(400, "text/plain", "Missing file parameter.");
+      return;
+    }
+    String name = server.arg("file");
+    if (name.isEmpty() || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 ||
+        name.indexOf("..") >= 0) {
+      server.send(400, "text/plain", "Invalid filename.");
+      return;
+    }
+
+    String path = "/" + name;
+    if (!SD.exists(path)) {
+      server.send(404, "text/plain", "File not found: " + path);
+      return;
+    }
+    if (path == buffer.getFileName()) {
+      server.send(409, "text/html",
+        "<html><body><h3>Cannot delete the active log.</h3>"
+        "<p>Stop logging or wait for the next log roll.</p>"
+        "<a href=\"/\">Back</a></body></html>");
+      return;
+    }
+
+    bool ok = SD.remove(path);
+    if (ok) {
+      SD.remove(path + ".wigle");
+      SD.remove(path + ".wdg");
+      SD.remove(path + ".wardrift");
+      Logger::log(GUD_MSG, "[WEB] Deleted " + path);
+    } else {
+      Logger::log(WARN_MSG, "[WEB] Could not delete " + path);
+    }
+
+    String result = "<html><body><h3>";
+    result += ok ? "Deleted " : "Could not delete ";
+    result += path;
+    result += "</h3><a href=\"/\">Back</a></body></html>";
+    server.send(ok ? 200 : 500, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
+  server.on("/deleteall", HTTP_GET, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+
+    const bool dry = server.hasArg("dry");
+    const bool uploadedOnly = server.hasArg("mode") &&
+                              server.arg("mode") == "uploaded";
+    // Snapshot the names first: removing an entry while iterating a FAT
+    // directory can invalidate the iterator.
+    String paths[64];
+    int count = 0;
+    File root = SD.open("/");
+    if (root && root.isDirectory()) {
+      File f = root.openNextFile();
+      while (f && count < 64) {
+        if (!f.isDirectory()) {
+          String name = f.name();
+          if (name.startsWith("/")) name = name.substring(1);
+          if (name.endsWith(".log") && name != "debug.log")
+            paths[count++] = "/" + name;
+        }
+        f = root.openNextFile();
+      }
+      root.close();
+    }
+
+    int deleted = 0;
+    int skipped = 0;
+    int failed = 0;
+    for (int i = 0; i < count; i++) {
+      if (paths[i] == buffer.getFileName()) { skipped++; continue; }
+      if (uploadedOnly &&
+          !(SD.exists(paths[i] + ".wigle") &&
+            SD.exists(paths[i] + ".wdg") &&
+            SD.exists(paths[i] + ".wardrift"))) {
+        skipped++;
+        continue;
+      }
+      if (dry) { deleted++; continue; }
+      if (SD.remove(paths[i])) {
+        SD.remove(paths[i] + ".wigle");
+        SD.remove(paths[i] + ".wdg");
+        SD.remove(paths[i] + ".wardrift");
+        deleted++;
+      } else {
+        failed++;
+      }
+    }
+
+    Logger::log(dry ? STD_MSG : GUD_MSG,
+      String("[WEB] Delete ") + (uploadedOnly ? "uploaded " : "all ") +
+      (dry ? "dry-run" : "complete") +
+      " deleted=" + String(deleted) + " skipped=" + String(skipped) +
+      " failed=" + String(failed));
+
+    String result = "<html><body><h3>";
+    result += dry ? "Dry run: " : "Deleted ";
+    result += String(deleted);
+    result += uploadedOnly ? " uploaded log(s).</h3>" : " log(s).</h3>";
+    result += "Skipped: " + String(skipped) + "<br>";
+    if (failed) result += "Failed: " + String(failed) + "<br>";
+    result += "<br><a href=\"/\">Back</a></body></html>";
+    server.send(200, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
   // ---- GET /upload : per-service upload with sidecar tracking ----
   server.on("/upload", HTTP_GET, [this]() {
     if (!this->checkAuth()) return;
@@ -3351,44 +3292,68 @@ void WiFiOps::serveConfigPage() {
       return;
     }
 
-    // ?svc=wigle|wdg|wardrift|both  ?retry=1
-    String svc   = server.hasArg("svc")   ? server.arg("svc")   : "both";
+    // ?svc=wigle|wdg|wardrift|all  ?retry=1
+    String svc   = server.hasArg("svc")   ? server.arg("svc")   : "all";
     bool   retry = server.hasArg("retry") && server.arg("retry") == "1";
 
-    bool wigle_ok    = true;
-    bool wdg_ok      = true;
-    bool wardrift_ok = true;
+    // Optional one-shot key update for a service upload. Lets a wardrift key
+    // be installed without the /save handler tearing down the web server.
+    if (server.hasArg("wd_key") && !server.arg("wd_key").isEmpty()) {
+      settings.saveSetting<bool>(WARDRIFT_KEY_NAME, server.arg("wd_key"));
+    }
+
+    bool wigle_ok = true;
+    bool wdg_ok   = true;
+    bool wd_ok    = true;
+    bool did_wigle = false;
+    bool did_wdg   = false;
+    bool did_wd    = false;
 
     if (svc == "wigle") {
+      did_wigle = true;
       bool already = !retry && this->sidecarExists(filePath, "wigle");
       if (!already) {
         wigle_ok = this->wigleUpload(filePath);
         if (wigle_ok) this->writeSidecar(filePath, "wigle");
       }
     } else if (svc == "wdg") {
+      did_wdg = true;
       bool already = !retry && this->sidecarExists(filePath, "wdg");
       if (!already) {
         wdg_ok = this->wdgwarsUpload(filePath);
         if (wdg_ok) this->writeSidecar(filePath, "wdg");
       }
     } else if (svc == "wardrift") {
+      did_wd = true;
+      this->pruneEmptyWardriftSidecar(filePath);
       bool already = !retry && this->sidecarExists(filePath, "wardrift");
       if (!already) {
-        wardrift_ok = this->wardriftUpload(filePath);
-        if (wardrift_ok) this->writeSidecar(filePath, "wardrift");
+        String keyOverride = server.hasArg("wd_key") ? server.arg("wd_key") : "";
+        wd_ok = this->wardriftUpload(filePath, keyOverride);
       }
+    } else if (svc == "all") {
+      did_wigle = did_wdg = did_wd = true;
+      UploadOutcome outcome;
+      this->uploadFile(filePath, retry, ALL_UPLOAD, &outcome);
+      wigle_ok = outcome.wigle;
+      wdg_ok   = outcome.wdg;
+      wd_ok    = outcome.wardrift;
     } else {
-      // both = all three services
+      // legacy "both"
+      did_wigle = did_wdg = true;
       bool ok = this->uploadFile(filePath, retry, BOTH_UPLOAD);
-      wigle_ok    = ok;
-      wdg_ok      = ok;
-      wardrift_ok = ok;
+      wigle_ok = ok;
+      wdg_ok   = ok;
     }
 
     String result = "<html><body><h3>Upload result for " + filePath + "</h3>";
-    result += "WiGLE: " + String(wigle_ok ? "&#10003; OK" : "&#10007; Failed") + "<br>";
-    result += "WDG Wars: " + String(wdg_ok  ? "&#10003; OK" : "&#10007; Failed") + "<br>";
-    result += "Wardrift.net: " + String(wardrift_ok ? "&#10003; OK" : "&#10007; Failed") + "<br><br>";
+    if (did_wigle)
+      result += "WiGLE: " + String(wigle_ok ? "&#10003; OK" : "&#10007; Failed") + "<br>";
+    if (did_wdg)
+      result += "WDG Wars: " + String(wdg_ok ? "&#10003; OK" : "&#10007; Failed") + "<br>";
+    if (did_wd)
+      result += "wardrift.net: " + String(wd_ok ? "&#10003; OK" : "&#10007; Failed") + "<br>";
+    result += "<br>";
     result += "<a href=\"/\">Back</a></body></html>";
 
     server.send(200, "text/html", result);
@@ -3484,7 +3449,13 @@ void WiFiOps::showCountdown() {
 bool WiFiOps::begin(bool skip_admin) {
   this->current_scan_mode = WIFI_STANDBY;
 
+#ifdef NODE
+  // Dedicated node image: always boot as a node. The web/LCD mode switch
+  // still works for the current session, but a reboot returns to node.
+  this->run_mode = NODE_MODE;
+#else
   this->run_mode = settings.loadSetting<int>("m");
+#endif
 
   if (!skip_admin) {
     // Init WiFi
@@ -3543,6 +3514,16 @@ bool WiFiOps::begin(bool skip_admin) {
           this->shutdownAccessPoint(false);
           break;
         }
+
+#ifdef NODE
+        // A field node must not park in the admin UI forever. Keep the page
+        // available while it is being used, then resume scanning.
+        if (millis() - this->last_web_client_activity > 3UL * 60UL * 1000UL) {
+          Logger::log(STD_MSG, "NODE: admin window idle, resuming scan");
+          this->shutdownAccessPoint(false);
+          break;
+        }
+#endif
       }
     }
 
@@ -3891,7 +3872,7 @@ void WiFiOps::main(uint32_t currentTime, bool in_sd_files) {
   if (this->current_scan_mode == WIFI_WARDRIVING)
     this->runWardrive(currentTime);
 
-  if ((this->run_mode == NODE_MODE) && (!g_have_core) && (this->use_encryption)) {
+  if ((this->run_mode == NODE_MODE) && (!g_have_core)) {
     if (currentTime - g_last_req_ms >= g_req_interval_ms) {
       g_last_req_ms = currentTime;
       this->sendCoreRequest();

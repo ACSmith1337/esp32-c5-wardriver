@@ -14,7 +14,7 @@
 // so they can be served via the /log web endpoint.
 // ============================================================
 #define LOG_RING_SIZE   100
-#define LOG_LINE_MAX    120  // max chars per line including prefix
+#define LOG_LINE_MAX    512  // max chars per line including prefix
 
 class Logger {
 public:

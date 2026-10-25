@@ -1,7 +1,15 @@
+# Build outputs and local test binaries
 build/
-*.log
-*.csv
+backup-*/
+*.bin
+*.elf
+*.map
 *.o
 *.d
-build/
-src/*.ino.cpp
+tools/batch_dump
+tools/test_led
+tools/test_wardrift
+
+# Local editor/OS noise
+.DS_Store
+*.swp

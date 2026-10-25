@@ -47,8 +47,9 @@ struct GeofenceEntry {
 
 #define WIGLE_UPLOAD 0
 #define WDG_UPLOAD   1
-#define WARDRIFT_UPLOAD 3
 #define BOTH_UPLOAD  2
+#define WARDRIFT_UPLOAD 3
+#define ALL_UPLOAD   4
 #define WIFI_STANDBY    0
 #define WIFI_WARDRIVING 1
 #define WIFI_UPDATE     2
@@ -99,6 +100,19 @@ struct NodeRecord {
   uint8_t flags;
 };
 
+struct NodeStatus {
+  uint16_t mac_suffix;
+  uint8_t start_channel;
+  uint8_t end_channel;
+  uint32_t last_seen_seconds;
+};
+
+struct UploadOutcome {
+  bool wigle = false;
+  bool wdg = false;
+  bool wardrift = false;
+};
+
 class WiFiOps
 {
   private:
@@ -114,8 +128,8 @@ class WiFiOps
     uint32_t dock_depart_time = 0;  // timestamp of last dock departure
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
-    const char* apSSID = "c5wardriver";
-    const char* apPassword = "c5wardriver";
+    String admin_ap_ssid = "c5wardriver";
+    String admin_ap_password = "c5wardriver";
 
     WiFiClientSecure *client = new WiFiClientSecure();
 
@@ -211,6 +225,8 @@ class WiFiOps
     bool use_encryption = false;
     bool isDocked() { return dock_state != DOCK_STATE_NONE; }
     uint8_t getNodeCount() { return getActiveNodeCount(); }
+    bool getNodeStatus(uint8_t active_index, NodeStatus& status);
+    String getDeviceMacAddress() const;
 
     uint8_t current_assignment_version = 1;
     uint8_t current_assigned_scan_idx = 0;
@@ -240,26 +256,22 @@ class WiFiOps
     bool tryConnectToWiFi(unsigned long timeoutMs = STATION_CONNECT_TIMEOUT);
     //bool backendUpload(String filePath, uint8_t upload_type = WIGLE_UPLOAD);
     bool wigleUpload(String filePath);
+    bool wardriftUpload(String filePath, const String& apiKeyOverride = "");
 
 
     // --------------------------------------------------------
     // Chunk 3: WDG Wars upload + sidecar tracking system
     // --------------------------------------------------------
     bool wdgwarsUpload(String filePath);       // upload one file to WDG Wars
-    bool wardriftUpload(String filePath);      // ingest one file's rows to wardrift.net
-    bool wardriftSendBatch(String apiKey,
-                           String itemsJson,
-                           uint64_t &seq,
-                           String deviceTs,
-                           uint64_t rowEpoch,
-                           String &lastErr);   // one JSON batch, retry on replay/reused
     bool sidecarExists(String filePath,
-                       String service);        // check .wigle / .wdg / .wardrift sidecar
+                       String service);        // check .wigle / .wdg sidecar
+    void pruneEmptyWardriftSidecar(String filePath);
     void writeSidecar(String filePath,
                       String service);         // write sidecar on success
     bool uploadFile(String filePath,
                     bool retry = false,
-                    uint8_t upload_type = WIGLE_UPLOAD);       // upload to both services (sidecar-aware)
+                    uint8_t upload_type = WIGLE_UPLOAD,
+                    UploadOutcome* outcome = nullptr);       // upload to selected services (sidecar-aware)
     void uploadAllPending();                   // scan SD and upload all files missing sidecars
     void setCurrentScanMode(uint8_t scan_mode);
     uint8_t getCurrentScanMode();
@@ -285,6 +297,7 @@ class WiFiOps
     bool getHasCore();
     bool getSecureReady();
     bool getNodeReady();
+    bool requiresCore();
     bool sendEncryptedStringToCore(const String& s);
     bool sendBroadcastStringPlain(const String& s);
     bool parseWardriveLine(const enow_text_msg_t& msg, WardriveRecord& out);

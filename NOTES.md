@@ -1,25 +1,53 @@
-# Wardriver Cluster (ESP32-C5)
+# Engineering notes
 
-## Purpose
-12-node ESP32-C5 wardriver cluster. JCMK ESP32DualBandWarddriver fork on XIAO ESP32-C5.
+## Current build
 
-## Hardware / build
-- 8MB flash: FQBN FlashSize=8M, PartitionScheme=huge_app.
-- Board gate in src/configs.h (commit 2f1e7e6):
-  - DEVKITC1 (default, manager/core): ESP32-C5-DevKitC-1 + JCMK 160x80 display.
-    JCMK_HOST_BOARD on (non-inverted INITR_MINI160x80). User LED GPIO28 active-high.
-    SELECT btn GPIO15. No fuel gauge.
-  - BOARD_XIAO_C5 (nodes): onboard LED GPIO27 active-low (scan-activity blink),
-    PLUGIN display init.
-- Pins (shared): TFT_CS=23 DC=24 MOSI=7 SCK=6 BL=27; SD_CS=10 MISO=2.
-- Flash set for DevKit: release-devkit/ (4-file C5 layout, boot_app0 at 0xE000).
+- Two variants: `jcmk` (JCMK carrier, LED GPIO28 active-high, runtime Solo/Core/Node) and `xiao` (bare XIAO ESP32-C5, LED GPIO27 active-low, forced NODE).
+- Partition scheme: `huge_app`, single 3 MB app at 0x10000. The image is about 1.86 MB.
+- `huge_app` has no OTA slot. WiFi updates require rebuilding with `default_8MB` and adding an OTA handler; the first migration is still USB.
+- App-only updates go to 0x10000. Full layout uses bootloader 0x2000, partitions 0x8000, app 0x10000. No OTA-data write at 0xE000.
 
-## Current state
-- Scan-blink LED: kept active-low on XIAO nodes to spot unpaired/working nodes in the field.
-- Cluster of 12 planned — pairing/coordination design open.
-- Wardrift.net batch upload feature present (per-batch TLS client, wd_seq,
-  idempotency). FIXED 2026-10-14 and verified end-to-end: sequence_no is now
-  millisecond-scaled (the server's space; seconds-scale sequences were all
-  rejected as sequence_replay) and the JSON item builder no longer emits a
-  stray quote after source_ts that invalidated every SSID row. A field C5
-  upload produced a real wardrift.net route (source: API key, APs counted).
+## wardrift.net
+
+- Device path: `POST https://wardrift.net/v1/ingest/signals` with `X-API-Key`.
+- TLS uses pinned ISRG roots. No `setInsecure()`.
+- NTP must be synced before the first upload.
+- Batches are 150 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.
+- Sequence numbers persist in `/wd_seq`. A 409 `sequence_replay` advances the sequence and retries.
+- Resume checkpoints live in `/wd_resume`, keyed by leaf filename and file size.
+- Headers-only logs return `no ingestable rows` and do not write a sidecar.
+- The device key must be an active `wdk_...` device key. Rotating it invalidates the old value immediately. Device ingest data appears in the signals and map feeds, not in the web account's manual log upload list.
+
+## Web UI
+
+- `Upload All` runs WiGLE, WDG Wars, and wardrift.net. Per-service links remain.
+- WiGLE and WDG responses are read to Content-Length and checked for a body verdict. A 200 is not assumed to be success when the body says otherwise.
+- `Delete` removes a log and its `.wigle`, `.wdg`, and `.wardrift` markers. The active log is refused.
+- `Delete All Logs` removes every `.log` except the active log and `debug.log`.
+- `Delete Uploaded Only` removes only logs that have all three service markers.
+- Settings JSON is 8192 bytes. At 4096 a long wardrift key could be saved truncated.
+- A wardrift key can be supplied as `wd_key` on `/upload` to install it without the `/save` handler stopping the web server.
+
+## XIAO node
+
+- LED engine is pure `LedPattern` plus an Arduino binding.
+- Scan yield produces one, two, or three short pulses. A quiet node emits a heartbeat. A bound node that loses its Core emits a distinct two-flash fault beacon.
+- The XIAO build forces NODE at boot. The admin web UI has an idle timeout so the node resumes scanning.
+
+## Known constraints
+
+- Wardrift keys expire or can be rotated. A 401 from a host probe means the key is no longer valid.
+- Many short `wardrive_*.log` files are header-only because no GPS fix was present. They cannot be uploaded.
+- The SD mount path retries at 4 MHz and then 1 MHz. A card that fails all retries needs a power cycle and reseat; a hard reset does not power-cycle the card.
+- The device joins the saved WiFi at boot and serves the admin page until the link drops or Save is pressed. Holding SELECT during boot skips the admin page.
+
+## Tests
+
+Host tests, no hardware:
+
+```sh
+g++ -std=c++17 -I../src test_led_pattern.cpp ../src/LedPattern.cpp -o test_led
+g++ -std=c++17 -I../src test_wardrift_format.cpp ../src/WardriftFormat.cpp -o test_wardrift
+```
+
+`batch_dump` plus `validate_batches.py` checks the real parser and envelope against field logs.

@@ -15,9 +15,21 @@ bool SDInterface::initSD() {
     //this->spiExt->begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
     //SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS); // Don't need this if init display first and using same SPI pins
     if (!SD.begin(SD_CS, *_spi)) {
-      Logger::log(WARN_MSG, "Failed to mount SD Card");
-      this->supported = false;
-      return false;
+      // A card that was reset mid-write can fail the first mount. Retry at a
+      // lower SPI clock before declaring the card absent.
+      bool mounted = false;
+      for (int attempt = 1; attempt <= 3 && !mounted; attempt++) {
+        Logger::log(WARN_MSG, "SD mount retry " + String(attempt) + " at 1 MHz");
+        SD.end();
+        delay(250);
+        mounted = SD.begin(SD_CS, *_spi, 1000000);
+      }
+      if (!mounted) {
+        Logger::log(WARN_MSG, "Failed to mount SD Card");
+        this->supported = false;
+        return false;
+      }
+      Logger::log(GUD_MSG, "SD mounted on retry");
     }
     else {
       Logger::log(GUD_MSG, "SD mounted successfully!");

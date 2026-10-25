@@ -23,14 +23,21 @@
 
 #define JCMK_HOST_BOARD
 
+// Board scope. Build with -DBOARD_XIAO_C5 for a bare Seeed XIAO ESP32-C5
+// node (onboard user LED GPIO27, active-low, no JCMK carrier).
+#if !defined(BOARD_XIAO_C5) && !defined(JCMK_HOST_BOARD)
+  #define JCMK_HOST_BOARD
+#endif
+
+
 //// Firmware info stuff
 #define FIRMWARE_VERSION "v2.3.2"
 #define DEVICE_NAME      "JCMK C5 Wardriver"
 
 //// Role stuff
-#define SOLO
-// #define CORE
-// #define NODE
+#if !defined(SOLO) && !defined(CORE) && !defined(NODE)
+  #define SOLO
+#endif
 
 #if !defined(SOLO) && !defined(CORE) && !defined(NODE)
   #error "Define exactly one role: SOLO, CORE, or NODE"
@@ -57,10 +64,23 @@
 
 
 //// LED stuff
-#define LED_PIN 28
-// LED polarity for the stock rig (active-high)
-#define LED_ON  HIGH
-#define LED_OFF LOW
+#ifdef BOARD_XIAO_C5
+  // Seeed XIAO ESP32-C5 onboard user LED: GPIO27, active-LOW.
+  #define LED_PIN 27
+  #define LED_ON  LOW
+  #define LED_OFF HIGH
+  #if LED_PIN != 27
+    #error "XIAO C5 user LED is GPIO27"
+  #endif
+  #if LED_ON != LOW
+    #error "XIAO C5 user LED is active-low"
+  #endif
+#else
+  // JCMK carrier board activity LED: GPIO28, active-HIGH.
+  #define LED_PIN 28
+  #define LED_ON  HIGH
+  #define LED_OFF LOW
+#endif
 
 
 //// Display stuff
@@ -78,7 +98,15 @@
 #define TOUCH_CS -1
 #define TFT_MOSI 7
 #define TFT_SCLK 6
-#define TFT_BL   27
+#ifdef BOARD_XIAO_C5
+  // GPIO27 is the XIAO user LED on a bare node. No panel/backlight.
+  #define TFT_BL -1
+  #if TFT_BL >= 0
+    #error "XIAO C5 user LED shares GPIO27 with TFT_BL; set TFT_BL=-1"
+  #endif
+#else
+  #define TFT_BL   27
+#endif
 
 
 //// UI Stuff
@@ -86,7 +114,12 @@
 
 #define U_BTN 9
 #define D_BTN 8
-#define C_BTN 1
+#ifdef BOARD_XIAO_C5
+  // XIAO BOOT button (GPIO28) doubles as "hold at power for admin UI".
+  #define C_BTN 28
+#else
+  #define C_BTN 1
+#endif
 
 #define C_PULL false
 #define U_PULL false
@@ -108,7 +141,9 @@
 
 
 //// Battery stuff
-#define HAS_BATTERY
+#ifndef BOARD_XIAO_C5
+  #define HAS_BATTERY
+#endif
 #define I2C_SCL 4
 #define I2C_SDA 5
 
@@ -172,8 +207,8 @@
 #define DOCK_FAIL_DISPLAY_MS   20 * 1000   // show K1T failure message for 20s
 #define STANDBY_SCAN_INTERVAL  30 * 1000   // scan for K1T every 30s while in standby (no GPS)
 
-//// Settings JSON buffer — bumped from 2048 to handle 30 settings entries
-#define SETTINGS_JSON_SIZE     4096
+//// Settings JSON buffer — bumped from 2048 to handle 32 settings entries
+#define SETTINGS_JSON_SIZE     8192
 
 // ============================================================
 // Chunk 6: Dock mode state constants

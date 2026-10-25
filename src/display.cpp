@@ -10,9 +10,10 @@ Display::Display(SPIClass* spi, int cs, int dc, int rst)
 }
 
 void Display::begin() {
-  pinMode(TFT_BL, OUTPUT);
-  
-  this->ctrlBacklight(false);
+  #if TFT_BL >= 0
+    pinMode(TFT_BL, OUTPUT);
+    this->ctrlBacklight(false);
+  #endif
 
   //tft.init();
   #ifndef JCMK_HOST_BOARD
@@ -78,10 +79,12 @@ void Display::drawMonochromeImage160x80(const uint8_t* imageData, int width, int
 }
 
 void Display::ctrlBacklight(bool on) {
-  if (on)
-    digitalWrite(TFT_BL, ON);
-  else
-    digitalWrite(TFT_BL, OFF);
+  #if TFT_BL >= 0
+    if (on)
+      digitalWrite(TFT_BL, ON);
+    else
+      digitalWrite(TFT_BL, OFF);
+  #endif
 }
 
 void Display::clearScreen() {
