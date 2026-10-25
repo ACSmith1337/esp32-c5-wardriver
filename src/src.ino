@@ -95,8 +95,6 @@ void setup() {
   // Init UI
   ui_obj.begin();
 
-  settings.printJsonSettings(settings.getSettingsString());
-
   Logger::log(GUD_MSG, "Initialization complete!");
 }
 

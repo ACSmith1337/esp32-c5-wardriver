@@ -2255,8 +2255,7 @@ bool WiFiOps::wigleUpload(String filePath) {
     return false;
   }
 
-  Logger::log(STD_MSG, "Username: " + username);
-  Logger::log(STD_MSG, "Token: " + token);
+  Logger::log(STD_MSG, "Uploading WiGLE file: " + filePath);
 
   String boundary = "----ESP32BOUNDARY";
   String contentType = "multipart/form-data; boundary=" + boundary;
@@ -2361,17 +2360,12 @@ bool WiFiOps::wigleUpload(String filePath) {
   int http_status = readHttpResponse(*client, response, 10000);
   client->stop();
 
-  String respLog = response;
-  respLog.replace("\r", " ");
-  respLog.replace("\n", " ");
-  if (respLog.length() > 300) respLog = respLog.substring(0, 300);
-  Logger::log(STD_MSG, "[WIGLE] status=" + String(http_status) +
-              " body=" + respLog);
-
   bool body_false = response.indexOf("\"success\":false") >= 0 ||
                     response.indexOf("\"success\": false") >= 0;
   bool body_true  = response.indexOf("\"success\":true") >= 0 ||
                     response.indexOf("\"success\": true") >= 0;
+  Logger::log(STD_MSG, "[WIGLE] status=" + String(http_status) +
+              " success=" + String(body_true ? "true" : "false"));
   bool ok = (http_status == 200) && !body_false;
   if (http_status == 200 && !body_true && !body_false)
     Logger::log(WARN_MSG, "[WIGLE] 200 without a success verdict in body");
