@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: %s <wardrive.log> [batch_rows]\n", argv[0]);
     return 2;
   }
-  int batch_rows = (argc > 2) ? std::atoi(argv[2]) : 150;
+  int batch_rows = (argc > 2) ? std::atoi(argv[2]) : 250;
   std::ifstream in(argv[1]);
   if (!in) {
     std::perror("open");

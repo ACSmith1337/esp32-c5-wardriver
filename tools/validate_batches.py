@@ -44,7 +44,7 @@ def main():
             fail(f"batch {bi}: bad device_ts")
         if b["signature"] != "":
             fail(f"batch {bi}: signature not empty")
-        if not (1 <= len(b["items"]) <= 150):
+        if not (1 <= len(b["items"]) <= 250):
             fail(f"batch {bi}: item count {len(b['items'])}")
         for it in b["items"]:
             if set(it) != REQUIRED:

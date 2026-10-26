@@ -3093,14 +3093,20 @@ void WiFiOps::serveConfigPage() {
       String candidate = server.arg("core_mac");
       candidate.trim();
       if (candidate.isEmpty()) {
-        settings.saveSetting<bool>(CORE_MAC_NAME, "");
+        // Empty string selects the String overload. Passing a plain "" would
+        // convert to bool and persist JSON true, which reloads as "true" and
+        // silently disables node-to-core binding.
+        settings.saveSetting<bool>(CORE_MAC_NAME, String(""));
       }
       else {
         uint8_t parsed_core[6];
         char normalized_core[18];
-        parseCoreMac(candidate.c_str(), parsed_core);
-        formatCoreMac(parsed_core, normalized_core);
-        settings.saveSetting<bool>(CORE_MAC_NAME, String(normalized_core));
+        if (parseCoreMac(candidate.c_str(), parsed_core)) {
+          formatCoreMac(parsed_core, normalized_core);
+          settings.saveSetting<bool>(CORE_MAC_NAME, String(normalized_core));
+        } else {
+          Logger::log(WARN_MSG, "Invalid core MAC rejected: " + candidate);
+        }
       }
       anyChange = true;
     }

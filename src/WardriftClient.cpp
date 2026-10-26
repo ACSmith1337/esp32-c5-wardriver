@@ -403,51 +403,120 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
 
   String items;
   items.reserve(WD_ITEMS_RESERVE);
+  // End offset of each serialized item inside `items`, so a rejected batch can
+  // be split without re-parsing the log.
+  uint32_t itemEnd[WD_BATCH_ROWS];
   uint16_t batchRows = 0;
   bool ok = true;
 
   auto flush = [&]() -> bool {
     if (batchRows == 0) return true;
     String deviceTs = isoNow();
-    String idem = batchIdem(apiKey, items);
-    String err;
-    int status = 0;
-    bool accepted = false;
-    for (int attempt = 0; attempt < 3; attempt++) {
-      uint64_t useq = seq + 1;
-      if (useq > WD_SEQ_CEILING) useq = WD_SEQ_CEILING;
-      if (sendBatch(apiKey, items, idem, useq, deviceTs, err, status)) {
-        seq = useq;
-        wardriftSaveSequence(seq);
-        st.sent += batchRows;
-        st.batches++;
-        saveResume(filePath, totalSize, (uint32_t)f.position());
-        accepted = true;
-        break;
+
+    // Split-on-rejection worklist. A 4xx that is not auth / sequence / rate
+    // limit means the server refused the payload, usually one bad row. Halve
+    // the range instead of failing the whole file; a single row that still
+    // fails is dropped and logged. If nothing in the batch is accepted, the
+    // rejection is treated as global and the upload fails.
+    struct Range { uint16_t a, b; };
+    Range stack[16];
+    uint8_t sp = 0;
+    stack[sp++] = {0, batchRows};
+    uint16_t accepted = 0;
+    uint16_t dropped = 0;
+    bool hardFail = false;
+    String failError;
+    String lastErr;
+
+    while (sp > 0 && !hardFail) {
+      Range r = stack[--sp];
+      String slice;
+      const String* payload = &items;
+      if (!(r.a == 0 && r.b == batchRows)) {
+        uint32_t start = (r.a == 0) ? 0 : itemEnd[r.a - 1] + 1;
+        uint32_t end = itemEnd[r.b - 1];
+        slice = items.substring(start, end);
+        payload = &slice;
       }
-      if (err == "sequence_replay") {
-        // Move above the server watermark we know about. Gaps are legal.
-        uint64_t jump = seq + 1000;
-        uint64_t wall = nowMs();
-        if (wall + 1000 > jump) jump = wall + 1000;
-        seq = (jump > WD_SEQ_CEILING) ? WD_SEQ_CEILING : jump;
-        Logger::log(WARN_MSG, "[WARDRIFT] sequence replay; retry at " +
-                    String((unsigned long long)seq));
+
+      String idem = batchIdem(apiKey, *payload);
+      String err;
+      int status = 0;
+      bool sent = false;
+      for (int attempt = 0; attempt < 3; attempt++) {
+        uint64_t useq = seq + 1;
+        if (useq > WD_SEQ_CEILING) useq = WD_SEQ_CEILING;
+        if (sendBatch(apiKey, *payload, idem, useq, deviceTs, err, status)) {
+          seq = useq;
+          wardriftSaveSequence(seq);
+          accepted += (uint16_t)(r.b - r.a);
+          st.sent += (r.b - r.a);
+          st.batches++;
+          sent = true;
+          break;
+        }
+        lastErr = err;
+        if (err == "sequence_replay") {
+          // Move above the server watermark we know about. Gaps are legal.
+          uint64_t jump = seq + 1000;
+          uint64_t wall = nowMs();
+          if (wall + 1000 > jump) jump = wall + 1000;
+          seq = (jump > WD_SEQ_CEILING) ? WD_SEQ_CEILING : jump;
+          Logger::log(WARN_MSG, "[WARDRIFT] sequence replay; retry at " +
+                      String((unsigned long long)seq));
+          continue;
+        }
+        if (status == 429) {
+          delay(2000);
+          continue;
+        }
+        if (status == 0 || status >= 500) {
+          delay(400);
+          continue;
+        }
+        break;  // auth / schema / other 4xx: retrying the same payload won't help
+      }
+      if (sent) continue;
+
+      bool payloadReject = (status == 400 || status == 413 ||
+                            status == 415 || status == 422);
+      if (payloadReject && (r.b - r.a) > 1 && (uint8_t)(sp + 2) <= 16) {
+        uint16_t mid = (uint16_t)(r.a + (r.b - r.a) / 2);
+        stack[sp++] = {(uint16_t)mid, r.b};
+        stack[sp++] = {r.a, (uint16_t)mid};
+        Logger::log(WARN_MSG, "[WARDRIFT] batch rejected (" + err +
+                    "); splitting rows " + String(r.a) + "-" + String(r.b));
         continue;
       }
-      if (status == 0 || status >= 500) {
-        delay(400);
+      if (payloadReject && (r.b - r.a) == 1) {
+        // One malformed row must not fail the whole file.
+        String bssid = jsonStringField(slice, "bssid");
+        st.skipped++;
+        dropped++;
+        Logger::log(WARN_MSG, "[WARDRIFT] dropped row bssid=" + bssid +
+                    " (" + err + ")");
+        // If nothing at all is accepted, the rejection is global (schema or
+        // key scope), not one bad row. Stop instead of walking every item.
+        if (accepted == 0 && dropped >= 10) {
+          hardFail = true;
+          failError = "payload rejected (" + err + ")";
+          break;
+        }
         continue;
       }
-      break;  // auth / schema / other 4xx: retrying the same batch won't help
+
+      hardFail = true;
+      failError = err.isEmpty() ? "batch failed" : err;
     }
-    if (!accepted) {
-      last_error_ = err.isEmpty() ? "batch failed" : err;
+
+    if (hardFail || accepted == 0) {
+      last_error_ = hardFail ? failError : (lastErr.isEmpty() ? "batch rejected" : lastErr);
       if (last_error_ == "sequence_replay")
         last_error_ = "sequence_replay: device key exhausted, mint a new key";
       Logger::log(WARN_MSG, "[WARDRIFT] Batch failed: " + last_error_);
       return false;
     }
+    saveResume(filePath, totalSize, (uint32_t)f.position());
     items = "";
     batchRows = 0;
     return true;
@@ -472,6 +541,7 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
     }
     if (batchRows > 0) items += ',';
     items += item;
+    itemEnd[batchRows] = items.length();
     batchRows++;
 
     if (batchRows >= WD_BATCH_ROWS) {

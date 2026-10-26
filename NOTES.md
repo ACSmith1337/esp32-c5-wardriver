@@ -14,6 +14,7 @@
 - NTP must be synced before the first upload.
 - Batches are 250 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.
 - The idempotency key is derived from the batch content and API key, so a retry after a lost response is recognized as a duplicate instead of being counted twice.
+- A 4xx payload rejection (400/413/415/422) splits the batch in half and retries. A single row that still fails is dropped and logged; the file fails only when nothing in the batch is accepted, and a run of 10 drops with no acceptance aborts as a global rejection.
 - Sequence numbers persist in `/wd_seq`. A 409 `sequence_replay` advances the sequence and retries.
 - Resume checkpoints live in `/wd_resume`, keyed by leaf filename and file size.
 - Headers-only logs return `no ingestable rows` and do not write a sidecar.
