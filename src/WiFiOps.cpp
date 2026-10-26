@@ -2768,6 +2768,7 @@ void WiFiOps::serveConfigPage() {
     html += "<label><input type=\"checkbox\" name=\"wd_public\" value=\"true\"";
     if (cur_wd_public) html += " checked";
     html += "> Publish routes publicly</label> &nbsp; <a href=\"/wdauth\">Test sign-in</a> &nbsp; <a href=\"/wdclear\" onclick=\"return confirm('Remove the stored wardrift account username and password?');\">Clear account</a><br><br>";
+    html += "<input type=\"submit\" formaction=\"/wdsave\" value=\"Save account and test\"><br><br>";
     html += "<small>Device API key (wdk_...) from the wardrift.net dashboard. "
             "Signals are ingested as individual WiFi/BLE observations with GPS, "
             "without an archived route.</small><br><br>";
@@ -3425,6 +3426,41 @@ void WiFiOps::serveConfigPage() {
 
     String result = "<html><body><h3>";
     result += ok ? "Signed in to wardrift.net" : "Sign-in failed";
+    result += "</h3>";
+    if (!ok) result += "<p>" + wardrift_client.lastError() + "</p>";
+    result += "<a href=\"/\">Back</a></body></html>";
+    server.send(ok ? 200 : 502, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
+  // ---- POST /wdsave : store the wardrift account and test sign-in without
+  // ---- shutting the web server down (the /save handler does).
+  server.on("/wdsave", HTTP_POST, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+
+    String user = server.hasArg("wd_user") ? server.arg("wd_user") : String("");
+    String pass = server.hasArg("wd_pass") ? server.arg("wd_pass") : String("");
+    bool   pub  = server.hasArg("wd_public") && server.arg("wd_public") == "true";
+    user.trim();
+
+    settings.saveSetting<bool>(WD_USER_NAME, user);
+    if (!pass.isEmpty()) settings.saveSetting<bool>(WD_PASS_NAME, pass);
+    settings.saveSetting<bool>(WD_PUBLIC_NAME, pub);
+    wardriftClearSession();
+
+    if (user.isEmpty()) {
+      server.send(200, "text/html",
+        "<html><body><h3>Wardrift account cleared.</h3>"
+        "<a href=\"/\">Back</a></body></html>");
+      return;
+    }
+
+    String savedPass = pass.isEmpty() ? settings.loadSetting<String>(WD_PASS_NAME) : pass;
+    bool ok = wardrift_client.testSignIn(user, savedPass);
+
+    String result = "<html><body><h3>";
+    result += ok ? "Account saved. Signed in." : "Account saved. Sign-in failed.";
     result += "</h3>";
     if (!ok) result += "<p>" + wardrift_client.lastError() + "</p>";
     result += "<a href=\"/\">Back</a></body></html>";
