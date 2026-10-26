@@ -13,3 +13,13 @@ tools/test_wardrift
 # Local editor/OS noise
 .DS_Store
 *.swp
+
+# Local secrets and captures (never commit credentials or field data)
+.env
+.env.*
+secrets*
+*.log
+*.csv
+settings.json
+*.pem
+*.key
