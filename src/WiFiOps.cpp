@@ -15,6 +15,28 @@ extern BatteryInterface battery;
 extern ActivityLed activity_led;
 extern bool g_force_display_redraw;
 
+// Small JSON field readers for status pages. The response bodies are small
+// and flat enough that a full parser is unnecessary.
+static String jsonStrField(const String& body, const char* key) {
+  String needle = "\"" + String(key) + "\":\"";
+  int i = body.indexOf(needle);
+  if (i < 0) return "";
+  i += needle.length();
+  int j = body.indexOf('"', i);
+  if (j < 0) return "";
+  return body.substring(i, j);
+}
+
+static long jsonNumField(const String& body, const char* key) {
+  String needle = "\"" + String(key) + "\":";
+  int i = body.indexOf(needle);
+  if (i < 0) return -1;
+  i += needle.length();
+  int j = i;
+  while (j < (int)body.length() && (body[j] == '-' || (body[j] >= '0' && body[j] <= '9'))) j++;
+  return body.substring(i, j).toInt();
+}
+
 WardriftClient wardrift_client;
 
 // Read one HTTP response with a Content-Length early exit. Returns the status
@@ -2767,7 +2789,7 @@ void WiFiOps::serveConfigPage() {
     html += "<br>";
     html += "<label><input type=\"checkbox\" name=\"wd_public\" value=\"true\"";
     if (cur_wd_public) html += " checked";
-    html += "> Publish routes publicly</label> &nbsp; <a href=\"/wdauth\">Test sign-in</a> &nbsp; <a href=\"/wdclear\" onclick=\"return confirm('Remove the stored wardrift account username and password?');\">Clear account</a><br><br>";
+    html += "> Publish routes publicly</label> &nbsp; <a href=\"/wdauth\">Test sign-in</a> &nbsp; <a href=\"/wdstatus\">Check last upload</a> &nbsp; <a href=\"/wdclear\" onclick=\"return confirm('Remove the stored wardrift account username and password?');\">Clear account</a><br><br>";
     html += "<input type=\"submit\" formaction=\"/wdsave\" value=\"Save account and test\"><br><br>";
     html += "<small>Device API key (wdk_...) from the wardrift.net dashboard. "
             "Signals are ingested as individual WiFi/BLE observations with GPS, "
@@ -3465,6 +3487,47 @@ void WiFiOps::serveConfigPage() {
     if (!ok) result += "<p>" + wardrift_client.lastError() + "</p>";
     result += "<a href=\"/\">Back</a></body></html>";
     server.send(ok ? 200 : 502, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
+  // ---- GET /wdstatus : processing verdict for the last route upload ----
+  server.on("/wdstatus", HTTP_GET, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+
+    String id = server.hasArg("id") ? server.arg("id") : wardriftLastUploadId();
+    if (id.isEmpty()) {
+      server.send(200, "text/html",
+        "<html><body><h3>No route upload recorded yet.</h3>"
+        "<a href=\"/\">Back</a></body></html>");
+      return;
+    }
+
+    String body;
+    int status = 0;
+    bool ok = wardrift_client.fetchUploadStatus(id, body, status);
+
+    String html = "<html><body><h3>Upload ";
+    html += id;
+    html += "</h3>";
+    if (!ok) {
+      html += "<p>" + wardrift_client.lastError() + "</p>";
+    } else {
+      html += "<p>HTTP " + String(status) + "</p>";
+      html += "<p>status: " + jsonStrField(body, "status") +
+              " decision: " + jsonStrField(body, "decision") +
+              " archived: " + String(jsonNumField(body, "archived_count")) +
+              " signals: " + String(jsonNumField(body, "accepted_signals")) +
+              " rows: " + String(jsonNumField(body, "parsed_rows")) +
+              " exp: " + String(jsonNumField(body, "awarded_exp")) + "</p>";
+      html += "<pre>";
+      String excerpt = body.substring(0, 1400);
+      excerpt.replace("<", "&lt;");
+      html += excerpt;
+      html += "</pre>";
+    }
+    html += "<a href=\"/\">Back</a></body></html>";
+    server.send(200, "text/html", html);
     this->last_web_client_activity = millis();
   });
 

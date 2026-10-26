@@ -34,6 +34,9 @@ class WardriftClient {
   // Used by the config page's Test sign-in action; uploads nothing.
   bool testSignIn(const String& username, const String& password);
 
+  // Fetch the processing verdict for an upload id. Used by /wdstatus.
+  bool fetchUploadStatus(const String& uploadId, String& body, int& httpStatus);
+
   const String& lastError() const { return last_error_; }
 
  private:
@@ -51,3 +54,4 @@ uint64_t wardriftLoadSequence();
 void     wardriftSaveSequence(uint64_t seq);
 bool     wardriftSessionCached();
 void     wardriftClearSession();
+String   wardriftLastUploadId();

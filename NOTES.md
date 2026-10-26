@@ -21,6 +21,11 @@
   or as a fallback when account sign-in is rejected and a key exists.
 - The account username and password live in settings `wd_user` / `wd_pass`.
   `Clear account` on the config page removes both and the cached session.
+- After an enqueue the device stores the id in `/wd_last_upload`; `/wdstatus`
+  fetches that upload's processing verdict (status, decision, archived count,
+  accepted signals, awarded exp) with the cached session.
+- `Save account and test` (`/wdsave`) stores the account and verifies sign-in
+  without stopping the web server, unlike `/save`.
 - TLS uses pinned ISRG roots. No `setInsecure()`.
 - NTP must be synced before the first upload.
 - Batches are 250 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.

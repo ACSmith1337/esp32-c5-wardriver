@@ -23,6 +23,7 @@ constexpr const char* WD_LOGS_PATH = "/v1/wardrive/logs";
 constexpr const char* WD_SEQ_FILE = "/wd_seq";
 constexpr const char* WD_RESUME_FILE = "/wd_resume";
 constexpr const char* WD_SESSION_FILE = "/wd_session";
+constexpr const char* WD_LAST_UPLOAD_FILE = "/wd_last_upload";
 constexpr uint16_t WD_BATCH_ROWS = 250;
 constexpr size_t WD_ITEMS_RESERVE = 56 * 1024;
 constexpr size_t WD_RESPONSE_CAP = 8192;
@@ -240,6 +241,14 @@ void saveSessionToken(const String& token) {
   f.close();
 }
 
+void saveLastUploadId(const String& id) {
+  if (id.isEmpty()) return;
+  File f = SPIFFS.open(WD_LAST_UPLOAD_FILE, FILE_WRITE);
+  if (!f) return;
+  f.print(id);
+  f.close();
+}
+
 }  // namespace
 
 bool wardriftSessionCached() {
@@ -249,6 +258,15 @@ bool wardriftSessionCached() {
 
 void wardriftClearSession() {
   SPIFFS.remove(WD_SESSION_FILE);
+}
+
+String wardriftLastUploadId() {
+  File f = SPIFFS.open(WD_LAST_UPLOAD_FILE, FILE_READ);
+  if (!f) return "";
+  String id = f.readStringUntil('\n');
+  f.close();
+  id.trim();
+  return id;
 }
 
 uint64_t wardriftLoadSequence() {
@@ -540,6 +558,45 @@ bool WardriftClient::sendRoute(const String& token, const String& filename, File
   return true;
 }
 
+bool WardriftClient::fetchUploadStatus(const String& uploadId, String& body, int& httpStatus) {
+  body = "";
+  httpStatus = 0;
+
+  String token;
+  if (!loadSessionToken(token)) {
+    last_error_ = "no session";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(WARDRIFT_CA_PEM);
+  client.setTimeout(WD_CONNECT_TIMEOUT_MS);
+  if (!client.connect(WD_HOST, WD_PORT)) {
+    last_error_ = "status connect failed";
+    return false;
+  }
+
+  String head;
+  head.reserve(320);
+  head += "GET /v1/wardrive/uploads/";
+  head += uploadId;
+  head += " HTTP/1.1\r\nHost: ";
+  head += WD_HOST;
+  head += "\r\nUser-Agent: wardriver-c5v2/2.0\r\nAccept: application/json\r\nAuthorization: Bearer ";
+  head += token;
+  head += "\r\nConnection: close\r\n\r\n";
+
+  if (!writeAll(client, (const uint8_t*)head.c_str(), head.length(), WD_IO_TIMEOUT_MS)) {
+    client.stop();
+    last_error_ = "status short write";
+    return false;
+  }
+
+  httpStatus = readResponse(client, body);
+  client.stop();
+  return true;
+}
+
 bool WardriftClient::testSignIn(const String& username, const String& password) {
   last_error_ = "";
   if (username.isEmpty() || password.isEmpty()) {
@@ -621,6 +678,7 @@ bool WardriftClient::uploadRoute(const String& filePath, const String& username,
       Logger::log(GUD_MSG, "[WARDRIFT] route upload_id=" + uploadId +
                   " status=" + (uploadStatus.isEmpty() ? "queued" : uploadStatus) +
                   " bytes=" + String((unsigned long)fileSize));
+      saveLastUploadId(uploadId);
       st.batches++;
       f.close();
       return true;
