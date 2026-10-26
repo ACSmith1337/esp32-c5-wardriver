@@ -638,6 +638,31 @@ bool WardriftClient::uploadRoute(const String& filePath, const String& username,
     return false;
   }
 
+  // Headers-only logs are not routes. Refuse locally instead of posting a
+  // file the server can only reject.
+  {
+    bool hasRows = false;
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.isEmpty()) continue;
+      if (line.startsWith("WigleWifi") || line.startsWith("MAC,")) continue;
+      hasRows = true;
+      break;
+    }
+    if (!hasRows) {
+      f.close();
+      last_error_ = "no ingestable rows";
+      Logger::log(WARN_MSG, "[WARDRIFT] No ingestable rows in " + filePath);
+      return false;
+    }
+    if (!f.seek(0)) {
+      f.close();
+      last_error_ = "seek failed";
+      return false;
+    }
+  }
+
   String filename = leafName(filePath);
   filename.replace("\"", "_");
   filename.replace("\r", "_");

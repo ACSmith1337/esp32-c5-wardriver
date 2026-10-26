@@ -206,6 +206,7 @@
 #define DOCK_DEPART_SCANS      2           // consecutive misses before resuming wardrive
 #define DOCK_FAIL_DISPLAY_MS   20 * 1000   // show K1T failure message for 20s
 #define STANDBY_SCAN_INTERVAL  30 * 1000   // scan for K1T every 30s while in standby (no GPS)
+#define ADMIN_IDLE_TIMEOUT_MS  (5UL * 60UL * 1000UL)  // leave the config page after 5 min idle
 
 //// Settings JSON buffer — bumped from 2048 to handle 32 settings entries
 #define SETTINGS_JSON_SIZE     8192

@@ -2113,6 +2113,12 @@ void WiFiOps::deinitBLE() {
 }
 
 void WiFiOps::initBLE() {
+  // Idempotent: dock mode only pauses BLE now, so a later init must not
+  // re-create the stack (NimBLE 2.3.0 deinit panics on ESP32-C5).
+  if (ble_initialized) {
+    if (pBLEScan != nullptr) pBLEScan->clearResults();
+    return;
+  }
   NimBLEDevice::init("");
   //delete pBLEScan;
   pBLEScan = NimBLEDevice::getScan();
@@ -2122,6 +2128,23 @@ void WiFiOps::initBLE() {
   pBLEScan->setDuplicateFilter(false);       // Disables internal filtering based on MAC
   pBLEScan->setMaxResults(0);                // Prevent storing results in NimBLEScanResults
   ble_initialized = true;
+}
+
+// Stop BLE work without tearing the stack down. NimBLEDevice::deinit() aborts
+// with heap corruption inside nimble_port_deinit on ESP32-C5 (core 3.3.0,
+// NimBLE-Arduino 2.3.0), which rebooted the rig every time it reached a dock.
+void WiFiOps::pauseBLE() {
+  if (!ble_initialized || pBLEScan == nullptr) return;
+  Logger::log(STD_MSG, "Pausing BLE for dock...");
+  if (pBLEScan->isScanning()) {
+    pBLEScan->stop();
+    uint32_t t0 = millis();
+    while (pBLEScan->isScanning() && millis() - t0 < 5000) {
+      delay(10);
+      esp_task_wdt_reset();
+    }
+  }
+  pBLEScan->clearResults();
 }
 
 bool WiFiOps::tryConnectToWiFi(unsigned long timeoutMs) {
@@ -2666,11 +2689,30 @@ bool WiFiOps::uploadFile(String filePath, bool retry, uint8_t upload_type,
   return false;
 }
 
-// Scan the SD card root for all .log files that are missing at least
-// one service sidecar, and upload them. Used by dock mode (Chunk 6).
+// True when a log holds at least one data row. Headers-only logs cannot be
+// uploaded anywhere and must not be retried on every dock.
+static bool logHasRows(const String& path) {
+  File lf = SD.open(path, FILE_READ);
+  if (!lf) return false;
+  if (lf.size() == 0) { lf.close(); return false; }
+
+  bool hasRows = false;
+  while (lf.available()) {
+    String line = lf.readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) continue;
+    if (line.startsWith("WigleWifi") || line.startsWith("MAC,")) continue;
+    hasRows = true;
+    break;
+  }
+  lf.close();
+  return hasRows;
+}
+
+// Scan the SD card root for all .log files that are missing at least one
+// service sidecar and upload them. Used by dock mode.
 void WiFiOps::uploadAllPending() {
   Logger::log(STD_MSG, "[UPLOAD] Scanning SD for pending uploads...");
-
   if (!sd_obj.supported) {
     Logger::log(WARN_MSG, "[UPLOAD] SD not available");
     return;
@@ -2692,6 +2734,12 @@ void WiFiOps::uploadAllPending() {
       String name = f.name();
       if (name.endsWith(".log") && name != "debug.log") {
         String path = "/" + name;
+        if (!logHasRows(path)) {
+          skipped++;
+          Logger::log(STD_MSG, "[UPLOAD] Empty log, skipped: " + path);
+          f = root.openNextFile();
+          continue;
+        }
         bool wigle_done = this->sidecarExists(path, "wigle");
         bool wdg_done   = this->sidecarExists(path, "wdg");
         bool wd_done    = this->sidecarExists(path, "wardrift");
@@ -3666,11 +3714,33 @@ bool WiFiOps::begin(bool skip_admin) {
 
     this->last_web_client_activity = millis();
 
+    uint32_t lastTriggerScan = 0;
+
     // Run AP loop
     if (!connected) {
       if (this->monitorAP()) {
         while (true) {
           server.handleClient();
+
+          // A rig parked on its own AP never scans, so it can never see the
+          // dock trigger. Scan for it while the page is up; when it appears,
+          // leave admin and let the dock state machine take over.
+          if (millis() - lastTriggerScan >= STANDBY_SCAN_INTERVAL) {
+            lastTriggerScan = millis();
+            String trig = settings.loadSetting<String>(TRIGGER_SSID_NAME);
+            if (!trig.isEmpty()) {
+              WiFi.mode(WIFI_AP_STA);
+              bool found = this->scanForTriggerSSID();
+              if (!found) WiFi.mode(WIFI_AP);
+              if (found) {
+                Logger::log(STD_MSG, "[DOCK] Trigger SSID found while serving admin AP");
+                this->dock_state            = DOCK_STATE_CONNECTING;
+                this->dock_connect_attempts = 0;
+                this->shutdownAccessPoint();
+                break;
+              }
+            }
+          }
 
           static bool wasConnected = WiFi.softAPgetStationNum() > 0;
           bool nowConnected = WiFi.softAPgetStationNum() > 0;
@@ -3691,10 +3761,29 @@ bool WiFiOps::begin(bool skip_admin) {
         server.handleClient();
         battery.main(millis());
 
-        // Stay connected until K1T actually disappears — no inactivity
-        // timeout when connected as a client to a known WLAN.
+        // Same trigger watch while connected to a known WLAN.
+        if (millis() - lastTriggerScan >= STANDBY_SCAN_INTERVAL) {
+          lastTriggerScan = millis();
+          String trig = settings.loadSetting<String>(TRIGGER_SSID_NAME);
+          if (!trig.isEmpty() && this->scanForTriggerSSID()) {
+            Logger::log(STD_MSG, "[DOCK] Trigger SSID found while serving admin page");
+            this->dock_state            = DOCK_STATE_CONNECTING;
+            this->dock_connect_attempts = 0;
+            this->shutdownAccessPoint(false);
+            break;
+          }
+        }
+
+        // Stay connected until the trigger actually disappears or the page
+        // goes idle. A parked rig must eventually resume scanning.
         if (WiFi.status() != WL_CONNECTED) {
           Logger::log(WARN_MSG, "WiFi connection lost — resuming wardriving...");
+          this->shutdownAccessPoint(false);
+          break;
+        }
+
+        if (millis() - this->last_web_client_activity > ADMIN_IDLE_TIMEOUT_MS) {
+          Logger::log(STD_MSG, "Admin page idle — resuming scan");
           this->shutdownAccessPoint(false);
           break;
         }
@@ -3852,11 +3941,13 @@ void WiFiOps::handleDockConnecting() {
   display.tft->println("Attempt " +
   String(this->dock_connect_attempts + 1) + "/3");
 
-  // Switch WiFi from scan/promiscuous to STA client
-  this->deinitBLE();
+  // Switch WiFi from scan/promiscuous to STA client. BLE is paused, not
+  // deinitialized: NimBLE 2.3.0's deinit aborts on this chip.
+  this->pauseBLE();
   this->deinitWiFi();
   this->initWiFi();
 
+  Logger::log(STD_MSG, "[DOCK] free heap=" + String(ESP.getFreeHeap()));
   WiFi.mode(WIFI_STA);
   WiFi.begin(trigSSID.c_str(), trigPass.c_str());
 
@@ -4083,8 +4174,17 @@ void WiFiOps::main(uint32_t currentTime, bool in_sd_files) {
       if (this->scanForTriggerSSID()) {
         Logger::log(STD_MSG, "[DOCK] Trigger SSID found in standby: " + trigSSID);
         this->dock_webui_only       = !gps.getFixStatus();
+        if (this->dock_webui_only)
+          Logger::log(WARN_MSG, "[DOCK] No GPS fix — web UI only, uploads deferred");
         this->dock_state            = DOCK_STATE_CONNECTING;
         this->dock_connect_attempts = 0;
+      } else {
+        static uint32_t lastAbsentLog = 0;
+        if (millis() - lastAbsentLog > 10UL * 60UL * 1000UL) {
+          lastAbsentLog = millis();
+          Logger::log(STD_MSG, "[DOCK] Standby: trigger '" + trigSSID +
+                      "' not visible, fix=" + String(gps.getFixStatus() ? 1 : 0));
+        }
       }
     }
   }

@@ -252,6 +252,7 @@ class WiFiOps
     void initBLE();
     void initWiFi(bool set_country = false);
     void deinitBLE();
+    void pauseBLE();
     void deinitWiFi();
     bool tryConnectToWiFi(unsigned long timeoutMs = STATION_CONNECT_TIMEOUT);
     //bool backendUpload(String filePath, uint8_t upload_type = WIGLE_UPLOAD);
