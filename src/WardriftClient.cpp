@@ -8,7 +8,7 @@
 #include <SD.h>
 #include <SPIFFS.h>
 #include <WiFiClientSecure.h>
-#include <esp_random.h>
+#include "mbedtls/sha256.h"
 #include <time.h>
 
 extern Display display;
@@ -20,8 +20,8 @@ constexpr uint16_t WD_PORT = 443;
 constexpr const char* WD_PATH = "/v1/ingest/signals";
 constexpr const char* WD_SEQ_FILE = "/wd_seq";
 constexpr const char* WD_RESUME_FILE = "/wd_resume";
-constexpr uint16_t WD_BATCH_ROWS = 150;
-constexpr size_t WD_ITEMS_RESERVE = 34 * 1024;
+constexpr uint16_t WD_BATCH_ROWS = 250;
+constexpr size_t WD_ITEMS_RESERVE = 56 * 1024;
 constexpr size_t WD_RESPONSE_CAP = 8192;
 constexpr uint64_t WD_SEQ_CEILING = 9000000000000000000ULL;
 constexpr uint32_t WD_CONNECT_TIMEOUT_MS = 15000;
@@ -45,17 +45,52 @@ bool writeAll(WiFiClient& c, const uint8_t* p, size_t len, uint32_t budgetMs) {
   return true;
 }
 
-String uuid4() {
+// Deterministic UUIDv5-style idempotency key. The same batch content and key
+// always produce the same id, so a retry after a lost response is recognized
+// by the server instead of counted twice.
+String batchIdem(const String& apiKey, const String& items) {
   static const char* hex = "0123456789abcdef";
-  char h[33];
-  for (int i = 0; i < 32; i++) h[i] = hex[esp_random() & 0xF];
-  h[12] = '4';                              // version 4
-  h[16] = "89ab"[esp_random() & 0x3];       // RFC 4122 variant
-  h[32] = '\0';
+  uint8_t h[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)apiKey.c_str(), apiKey.length());
+  mbedtls_sha256_update(&ctx, (const unsigned char*)items.c_str(), items.length());
+  mbedtls_sha256_finish(&ctx, h);
+  mbedtls_sha256_free(&ctx);
+
+  h[6] = (h[6] & 0x0F) | 0x50;  // version 5
+  h[8] = (h[8] & 0x3F) | 0x80;  // RFC 4122 variant
+
   char out[37];
-  snprintf(out, sizeof(out), "%.8s-%.4s-%.4s-%.4s-%.12s",
-           h, h + 8, h + 12, h + 16, h + 20);
+  int p = 0;
+  for (int i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) out[p++] = '-';
+    out[p++] = hex[(h[i] >> 4) & 0xF];
+    out[p++] = hex[h[i] & 0xF];
+  }
+  out[p] = '\0';
   return String(out);
+}
+
+String jsonStringField(const String& body, const char* key) {
+  String needle = "\"" + String(key) + "\":\"";
+  int i = body.indexOf(needle);
+  if (i < 0) return "";
+  i += needle.length();
+  int j = body.indexOf('"', i);
+  if (j < 0) return "";
+  return body.substring(i, j);
+}
+
+long jsonIntField(const String& body, const char* key) {
+  String needle = "\"" + String(key) + "\":";
+  int i = body.indexOf(needle);
+  if (i < 0) return -1;
+  i += needle.length();
+  int j = i;
+  while (j < (int)body.length() && (body[j] == '-' || (body[j] >= '0' && body[j] <= '9'))) j++;
+  return body.substring(i, j).toInt();
 }
 
 String isoNow() {
@@ -208,7 +243,8 @@ bool WardriftClient::ensureClock() {
 }
 
 bool WardriftClient::sendBatch(const String& apiKey, const String& items,
-                               uint64_t seq, const String& deviceTs,
+                               const String& idem, uint64_t seq,
+                               const String& deviceTs,
                                String& error, int& httpStatus) {
   error = "";
   httpStatus = 0;
@@ -217,7 +253,7 @@ bool WardriftClient::sendBatch(const String& apiKey, const String& items,
   prefix.reserve(256);
   char prefix_buf[256];
   size_t prefix_len = wd_envelope_prefix(prefix_buf, sizeof(prefix_buf),
-                                         uuid4().c_str(), seq, deviceTs.c_str());
+                                         idem.c_str(), seq, deviceTs.c_str());
   if (prefix_len == 0) {
     error = "envelope";
     return false;
@@ -277,6 +313,18 @@ bool WardriftClient::sendBatch(const String& apiKey, const String& items,
   int status = readResponse(client, body);
   client.stop();
   httpStatus = status;
+
+  if (status == 200) {
+    String batchId = jsonStringField(body, "batch_id");
+    long itemCount = jsonIntField(body, "item_count");
+    long awardedExp = jsonIntField(body, "awarded_exp");
+    bool duplicate = body.indexOf("\"duplicate\":true") >= 0 ||
+                     body.indexOf("\"duplicate\": true") >= 0;
+    Logger::log(GUD_MSG, "[WARDRIFT] batch=" + batchId +
+                " items=" + String(itemCount) +
+                " duplicate=" + String(duplicate ? "yes" : "no") +
+                " exp=" + String(awardedExp));
+  }
 
   WdVerdict verdict = wd_classify_response(status, body.c_str());
   switch (verdict) {
@@ -361,13 +409,14 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
   auto flush = [&]() -> bool {
     if (batchRows == 0) return true;
     String deviceTs = isoNow();
+    String idem = batchIdem(apiKey, items);
     String err;
     int status = 0;
     bool accepted = false;
     for (int attempt = 0; attempt < 3; attempt++) {
       uint64_t useq = seq + 1;
       if (useq > WD_SEQ_CEILING) useq = WD_SEQ_CEILING;
-      if (sendBatch(apiKey, items, useq, deviceTs, err, status)) {
+      if (sendBatch(apiKey, items, idem, useq, deviceTs, err, status)) {
         seq = useq;
         wardriftSaveSequence(seq);
         st.sent += batchRows;
@@ -384,10 +433,6 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
         seq = (jump > WD_SEQ_CEILING) ? WD_SEQ_CEILING : jump;
         Logger::log(WARN_MSG, "[WARDRIFT] sequence replay; retry at " +
                     String((unsigned long long)seq));
-        continue;
-      }
-      if (err == "idempotency_key_reused") {
-        // A fresh UUID is generated on every sendBatch call.
         continue;
       }
       if (status == 0 || status >= 500) {

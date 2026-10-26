@@ -23,8 +23,8 @@ class WardriftClient {
 
  private:
   bool ensureClock();
-  bool sendBatch(const String& apiKey, const String& items, uint64_t seq,
-                 const String& deviceTs, String& error, int& httpStatus);
+  bool sendBatch(const String& apiKey, const String& items, const String& idem,
+                 uint64_t seq, const String& deviceTs, String& error, int& httpStatus);
   String last_error_;
 };
 

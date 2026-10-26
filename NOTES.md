@@ -12,7 +12,8 @@
 - Device path: `POST https://wardrift.net/v1/ingest/signals` with `X-API-Key`.
 - TLS uses pinned ISRG roots. No `setInsecure()`.
 - NTP must be synced before the first upload.
-- Batches are 150 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.
+- Batches are 250 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.
+- The idempotency key is derived from the batch content and API key, so a retry after a lost response is recognized as a duplicate instead of being counted twice.
 - Sequence numbers persist in `/wd_seq`. A 409 `sequence_replay` advances the sequence and retries.
 - Resume checkpoints live in `/wd_resume`, keyed by leaf filename and file size.
 - Headers-only logs return `no ingestable rows` and do not write a sidecar.
