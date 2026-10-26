@@ -9,7 +9,18 @@
 
 ## wardrift.net
 
+- Two paths. Account route: sign in at `/v1/auth/sign-in/username` with
+  `{"username","password","remember_me":true}`, cache the returned
+  `session.token` in `/wd_session`, then POST the raw WiGLE CSV to
+  `/v1/wardrive/logs` as multipart (`file`, `public_route`) with
+  `Authorization: Bearer`. This creates the archived route the browser upload
+  creates. A 401 drops the cached token and signs in once more; 409
+  `duplicate_route` counts as already uploaded.
 - Device path: `POST https://wardrift.net/v1/ingest/signals` with `X-API-Key`.
+  Individual signals, no archived route. Used when no account is configured,
+  or as a fallback when account sign-in is rejected and a key exists.
+- The account username and password live in settings `wd_user` / `wd_pass`.
+  `Clear account` on the config page removes both and the cached session.
 - TLS uses pinned ISRG roots. No `setInsecure()`.
 - NTP must be synced before the first upload.
 - Batches are 250 rows. The parser accepts both 11-column legacy and 14-column current WiGLE CSV. Empty SSIDs are preserved.

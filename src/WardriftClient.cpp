@@ -18,8 +18,11 @@ namespace {
 constexpr const char* WD_HOST = "wardrift.net";
 constexpr uint16_t WD_PORT = 443;
 constexpr const char* WD_PATH = "/v1/ingest/signals";
+constexpr const char* WD_SIGNIN_PATH = "/v1/auth/sign-in/username";
+constexpr const char* WD_LOGS_PATH = "/v1/wardrive/logs";
 constexpr const char* WD_SEQ_FILE = "/wd_seq";
 constexpr const char* WD_RESUME_FILE = "/wd_resume";
+constexpr const char* WD_SESSION_FILE = "/wd_session";
 constexpr uint16_t WD_BATCH_ROWS = 250;
 constexpr size_t WD_ITEMS_RESERVE = 56 * 1024;
 constexpr size_t WD_RESPONSE_CAP = 8192;
@@ -196,7 +199,57 @@ int readResponse(WiFiClientSecure& c, String& body) {
   return status;
 }
 
+String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char esc[7];
+          snprintf(esc, sizeof(esc), "\\u%04x", (uint8_t)c);
+          out += esc;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+bool loadSessionToken(String& token) {
+  token = "";
+  File f = SPIFFS.open(WD_SESSION_FILE, FILE_READ);
+  if (!f) return false;
+  token = f.readStringUntil('\n');
+  f.close();
+  token.trim();
+  return !token.isEmpty();
+}
+
+void saveSessionToken(const String& token) {
+  File f = SPIFFS.open(WD_SESSION_FILE, FILE_WRITE);
+  if (!f) return;
+  f.print(token);
+  f.close();
+}
+
 }  // namespace
+
+bool wardriftSessionCached() {
+  String token;
+  return loadSessionToken(token);
+}
+
+void wardriftClearSession() {
+  SPIFFS.remove(WD_SESSION_FILE);
+}
 
 uint64_t wardriftLoadSequence() {
   File f = SPIFFS.open(WD_SEQ_FILE, FILE_READ);
@@ -356,6 +409,256 @@ bool WardriftClient::sendBatch(const String& apiKey, const String& items,
     excerpt.replace("\n", " ");
     if (!excerpt.isEmpty()) error += ": " + excerpt;
   }
+  return false;
+}
+
+bool WardriftClient::signIn(const String& username, const String& password, String& token) {
+  token = "";
+
+  WiFiClientSecure client;
+  client.setCACert(WARDRIFT_CA_PEM);
+  client.setTimeout(WD_CONNECT_TIMEOUT_MS);
+  if (!client.connect(WD_HOST, WD_PORT)) {
+    last_error_ = "sign-in connect failed";
+    return false;
+  }
+
+  String body;
+  body.reserve(192);
+  body = "{\"username\":\"";
+  body += jsonEscape(username);
+  body += "\",\"password\":\"";
+  body += jsonEscape(password);
+  body += "\",\"remember_me\":true}";
+
+  String head;
+  head.reserve(320);
+  head += "POST ";
+  head += WD_SIGNIN_PATH;
+  head += " HTTP/1.1\r\nHost: ";
+  head += WD_HOST;
+  head += "\r\nUser-Agent: wardriver-c5v2/2.0\r\nAccept: application/json\r\n";
+  head += "Content-Type: application/json\r\nConnection: close\r\nContent-Length: ";
+  head += String((unsigned long)body.length());
+  head += "\r\n\r\n";
+
+  bool sent = writeAll(client, (const uint8_t*)head.c_str(), head.length(), WD_IO_TIMEOUT_MS) &&
+              writeAll(client, (const uint8_t*)body.c_str(), body.length(), WD_IO_TIMEOUT_MS);
+  if (!sent) {
+    client.stop();
+    last_error_ = "sign-in short write";
+    return false;
+  }
+
+  String response;
+  int status = readResponse(client, response);
+  client.stop();
+
+  if (status == 200) {
+    token = jsonStringField(response, "token");
+    if (token.isEmpty()) {
+      last_error_ = "sign-in returned no token";
+      return false;
+    }
+    Logger::log(GUD_MSG, "[WARDRIFT] Signed in");
+    return true;
+  }
+
+  last_error_ = (status == 401 || status == 403) ? "sign-in rejected"
+                                                : "sign-in HTTP " + String(status);
+  Logger::log(WARN_MSG, "[WARDRIFT] " + last_error_);
+  return false;
+}
+
+bool WardriftClient::sendRoute(const String& token, const String& filename, File& file,
+                               uint32_t fileSize, bool publicRoute, String& response,
+                               int& httpStatus) {
+  response = "";
+  httpStatus = 0;
+
+  String boundary = "----wardriverC5v2Boundary";
+  String head1;
+  head1.reserve(320);
+  head1 += "--";
+  head1 += boundary;
+  head1 += "\r\nContent-Disposition: form-data; name=\"public_route\"\r\n\r\n";
+  head1 += publicRoute ? "true" : "false";
+  head1 += "\r\n--";
+  head1 += boundary;
+  head1 += "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"";
+  head1 += filename;
+  head1 += "\"\r\nContent-Type: text/csv\r\n\r\n";
+
+  String tail;
+  tail.reserve(64);
+  tail += "\r\n--";
+  tail += boundary;
+  tail += "--\r\n";
+
+  size_t total = head1.length() + fileSize + tail.length();
+
+  WiFiClientSecure client;
+  client.setCACert(WARDRIFT_CA_PEM);
+  client.setTimeout(WD_CONNECT_TIMEOUT_MS);
+  if (!client.connect(WD_HOST, WD_PORT)) {
+    last_error_ = "route connect failed";
+    return false;
+  }
+
+  String head;
+  head.reserve(384);
+  head += "POST ";
+  head += WD_LOGS_PATH;
+  head += " HTTP/1.1\r\nHost: ";
+  head += WD_HOST;
+  head += "\r\nUser-Agent: wardriver-c5v2/2.0\r\nAccept: application/json\r\nAuthorization: Bearer ";
+  head += token;
+  head += "\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary=";
+  head += boundary;
+  head += "\r\nContent-Length: ";
+  head += String((unsigned long)total);
+  head += "\r\n\r\n";
+
+  bool ok = writeAll(client, (const uint8_t*)head.c_str(), head.length(), WD_IO_TIMEOUT_MS) &&
+            writeAll(client, (const uint8_t*)head1.c_str(), head1.length(), WD_IO_TIMEOUT_MS);
+
+  uint8_t buf[2048];
+  while (ok && file.available()) {
+    size_t n = file.read(buf, sizeof(buf));
+    if (n == 0) break;
+    ok = writeAll(client, buf, (size_t)n, WD_IO_TIMEOUT_MS);
+  }
+  ok = ok && writeAll(client, (const uint8_t*)tail.c_str(), tail.length(), WD_IO_TIMEOUT_MS);
+  if (!ok) {
+    client.stop();
+    last_error_ = "route short write";
+    return false;
+  }
+
+  httpStatus = readResponse(client, response);
+  client.stop();
+  return true;
+}
+
+bool WardriftClient::testSignIn(const String& username, const String& password) {
+  last_error_ = "";
+  if (username.isEmpty() || password.isEmpty()) {
+    last_error_ = "account credentials missing";
+    return false;
+  }
+  if (!ensureClock()) return false;
+  String token;
+  if (!signIn(username, password, token)) return false;
+  saveSessionToken(token);
+  return true;
+}
+
+bool WardriftClient::uploadRoute(const String& filePath, const String& username,
+                                 const String& password, bool publicRoute,
+                                 Stats* stats) {
+  last_error_ = "";
+  Stats local;
+  Stats& st = stats ? *stats : local;
+  st = Stats();
+
+  if (!SD.exists(filePath)) {
+    last_error_ = "file not found";
+    Logger::log(WARN_MSG, "[WARDRIFT] File not found: " + filePath);
+    return false;
+  }
+  if (!ensureClock()) return false;
+
+  File f = SD.open(filePath, FILE_READ);
+  if (!f) {
+    last_error_ = "open failed";
+    Logger::log(WARN_MSG, "[WARDRIFT] Could not open " + filePath);
+    return false;
+  }
+  uint32_t fileSize = (uint32_t)f.size();
+  if (fileSize == 0) {
+    f.close();
+    last_error_ = "empty log";
+    return false;
+  }
+
+  String filename = leafName(filePath);
+  filename.replace("\"", "_");
+  filename.replace("\r", "_");
+  filename.replace("\n", "_");
+
+  String token;
+  bool haveToken = loadSessionToken(token);
+
+  display.clearScreen();
+  display.drawCenteredText("Wardrift route", true);
+
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (!haveToken) {
+      if (!signIn(username, password, token)) {
+        f.close();
+        return false;
+      }
+      saveSessionToken(token);
+      haveToken = true;
+    }
+
+    if (!f.seek(0)) {
+      f.close();
+      last_error_ = "seek failed";
+      return false;
+    }
+
+    int status = 0;
+    String response;
+    if (!sendRoute(token, filename, f, fileSize, publicRoute, response, status)) {
+      f.close();
+      return false;
+    }
+
+    if (status == 200 || status == 201 || status == 202) {
+      String uploadId = jsonStringField(response, "upload_id");
+      String uploadStatus = jsonStringField(response, "status");
+      Logger::log(GUD_MSG, "[WARDRIFT] route upload_id=" + uploadId +
+                  " status=" + (uploadStatus.isEmpty() ? "queued" : uploadStatus) +
+                  " bytes=" + String((unsigned long)fileSize));
+      st.batches++;
+      f.close();
+      return true;
+    }
+
+    if (status == 409 && response.indexOf("duplicate_route") >= 0) {
+      Logger::log(GUD_MSG, "[WARDRIFT] route already uploaded (duplicate_route)");
+      st.batches++;
+      f.close();
+      return true;
+    }
+
+    if (status == 401 || status == 403) {
+      // Session expired or revoked. Drop it and sign in again once.
+      wardriftClearSession();
+      haveToken = false;
+      Logger::log(WARN_MSG, "[WARDRIFT] Session rejected; signing in again");
+      continue;
+    }
+
+    if (status == 0 || status == 429 || status >= 500) {
+      delay(1500);
+      continue;
+    }
+
+    last_error_ = "route HTTP " + String(status);
+    String excerpt = response.substring(0, 240);
+    excerpt.replace("\r", " ");
+    excerpt.replace("\n", " ");
+    if (!excerpt.isEmpty()) last_error_ += ": " + excerpt;
+    Logger::log(WARN_MSG, "[WARDRIFT] " + last_error_);
+    f.close();
+    return false;
+  }
+
+  f.close();
+  if (last_error_.isEmpty()) last_error_ = "route upload failed";
+  Logger::log(WARN_MSG, "[WARDRIFT] " + last_error_);
   return false;
 }
 

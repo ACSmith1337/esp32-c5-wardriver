@@ -451,7 +451,7 @@ void Settings::printJsonSettings(String json_string) {
     String name = json["Settings"][i]["name"].as<String>();
     String value = json["Settings"][i]["value"].as<String>();
     if (name == "wu" || name == "wt" || name == WDG_KEY_NAME ||
-        name == WARDRIFT_KEY_NAME || name == ADMIN_PASS_NAME ||
+        name == WARDRIFT_KEY_NAME || name == WD_PASS_NAME || name == ADMIN_PASS_NAME ||
         name == ADMIN_AP_PASS_NAME || name == TRIGGER_PASS_NAME || name == "ek") {
       value = value.isEmpty() ? "" : "<set>";
     }
@@ -590,6 +590,26 @@ bool Settings::createDefaultSettings(fs::FS &fs, bool spec, uint8_t index, Strin
     jsonBuffer["Settings"][31]["value"] = "";
     jsonBuffer["Settings"][31]["range"]["min"] = "";
     jsonBuffer["Settings"][31]["range"]["max"] = "";
+
+    // [33-34] wardrift.net account credentials for the route upload path
+    jsonBuffer["Settings"][33]["name"] = WD_USER_NAME;
+    jsonBuffer["Settings"][33]["type"] = "String";
+    jsonBuffer["Settings"][33]["value"] = "";
+    jsonBuffer["Settings"][33]["range"]["min"] = "";
+    jsonBuffer["Settings"][33]["range"]["max"] = "";
+
+    jsonBuffer["Settings"][34]["name"] = WD_PASS_NAME;
+    jsonBuffer["Settings"][34]["type"] = "String";
+    jsonBuffer["Settings"][34]["value"] = "";
+    jsonBuffer["Settings"][34]["range"]["min"] = "";
+    jsonBuffer["Settings"][34]["range"]["max"] = "";
+
+    // [35] publish uploaded routes publicly
+    jsonBuffer["Settings"][35]["name"] = WD_PUBLIC_NAME;
+    jsonBuffer["Settings"][35]["type"] = "bool";
+    jsonBuffer["Settings"][35]["value"] = false;
+    jsonBuffer["Settings"][35]["range"]["min"] = false;
+    jsonBuffer["Settings"][35]["range"]["max"] = true;
 
     if (serializeJson(jsonBuffer, settings_string) == 0) {
       Logger::log(WARN_MSG, "Failed to write to string");

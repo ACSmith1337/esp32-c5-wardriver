@@ -2201,17 +2201,35 @@ bool WiFiOps::wardriftUpload(String filePath, const String& apiKeyOverride) {
   String apiKey = apiKeyOverride;
   if (apiKey.isEmpty())
     apiKey = settings.loadSetting<String>(WARDRIFT_KEY_NAME);
-  if (apiKey.isEmpty()) {
-    display.clearScreen();
-    display.drawCenteredText("No wardrift key", true);
-    Logger::log(WARN_MSG, "[WARDRIFT] No API key configured");
-    return false;
-  }
-  Logger::log(STD_MSG, "[WARDRIFT] key " + apiKey.substring(0, 8) + "..." +
-              apiKey.substring(apiKey.length() >= 4 ? apiKey.length() - 4 : 0));
+
+  String wdUser   = settings.loadSetting<String>(WD_USER_NAME);
+  String wdPass   = settings.loadSetting<String>(WD_PASS_NAME);
+  bool   wdPublic = settings.loadSetting<bool>(WD_PUBLIC_NAME);
 
   Logger::log(STD_MSG, "[WARDRIFT] Uploading: " + filePath);
-  bool ok = wardrift_client.uploadFile(filePath, apiKey);
+
+  bool ok = false;
+  if (!wdUser.isEmpty() && !wdPass.isEmpty()) {
+    Logger::log(STD_MSG, "[WARDRIFT] Account route upload");
+    ok = wardrift_client.uploadRoute(filePath, wdUser, wdPass, wdPublic);
+    if (!ok && !apiKey.isEmpty()) {
+      String err = wardrift_client.lastError();
+      bool authFailure = err.startsWith("sign-in") ||
+                         err.startsWith("route HTTP 401") ||
+                         err.startsWith("route HTTP 403");
+      if (authFailure) {
+        Logger::log(WARN_MSG, "[WARDRIFT] Account path rejected; sending signals with device key");
+        ok = wardrift_client.uploadFile(filePath, apiKey);
+      }
+    }
+  } else if (!apiKey.isEmpty()) {
+    ok = wardrift_client.uploadFile(filePath, apiKey);
+  } else {
+    display.clearScreen();
+    display.drawCenteredText("No wardrift creds", true);
+    Logger::log(WARN_MSG, "[WARDRIFT] No account or device key configured");
+    return false;
+  }
   if (ok) {
     this->writeSidecar(filePath, "wardrift");
     Logger::log(GUD_MSG, "[WARDRIFT] Upload succeeded");
@@ -2706,6 +2724,9 @@ void WiFiOps::serveConfigPage() {
     String cur_wigle_user  = settings.loadSetting<String>("wu");
     String cur_wdg_key     = settings.loadSetting<String>(WDG_KEY_NAME);
     String cur_wd_key      = settings.loadSetting<String>(WARDRIFT_KEY_NAME);
+    String cur_wd_user     = settings.loadSetting<String>(WD_USER_NAME);
+    bool   cur_wd_public   = settings.loadSetting<bool>(WD_PUBLIC_NAME);
+    bool   cur_wd_session  = wardriftSessionCached();
     String cur_t_ssid      = settings.loadSetting<String>(TRIGGER_SSID_NAME);
     String cur_admin_ap_ssid = settings.loadSetting<String>(ADMIN_AP_SSID_NAME);
     String cur_core_mac = settings.loadSetting<String>(CORE_MAC_NAME);
@@ -2737,7 +2758,19 @@ void WiFiOps::serveConfigPage() {
 
     // ---- wardrift.net ----
     html += "<h3>wardrift.net</h3>";
-    html += "<small>Device API key (wdk_...) from the wardrift.net dashboard. Signals are ingested as individual WiFi/BLE observations with GPS.</small><br><br>";
+    html += "<small><b>Account upload</b> posts the raw WiGLE CSV as a route "
+            "(distance, AP count, streak), the same archive the browser upload "
+            "creates. Falls back to the device key when no account is set.</small><br><br>";
+    html += "Username: <input type=\"text\" name=\"wd_user\" value=\"" + cur_wd_user + "\"><br>";
+    html += "Password: <input type=\"password\" name=\"wd_pass\" placeholder=\"leave blank to keep\">";
+    if (cur_wd_session) html += " <em>(session cached)</em>";
+    html += "<br>";
+    html += "<label><input type=\"checkbox\" name=\"wd_public\" value=\"true\"";
+    if (cur_wd_public) html += " checked";
+    html += "> Publish routes publicly</label> &nbsp; <a href=\"/wdauth\">Test sign-in</a> &nbsp; <a href=\"/wdclear\" onclick=\"return confirm('Remove the stored wardrift account username and password?');\">Clear account</a><br><br>";
+    html += "<small>Device API key (wdk_...) from the wardrift.net dashboard. "
+            "Signals are ingested as individual WiFi/BLE observations with GPS, "
+            "without an archived route.</small><br><br>";
     html += "API Key: <input type=\"password\" name=\"wd_key\" placeholder=\"leave blank to keep\">";
     if (!cur_wd_key.isEmpty()) html += " <em>(key saved)</em>";
     html += "<br>";
@@ -3003,6 +3036,25 @@ void WiFiOps::serveConfigPage() {
     }
     if (server.hasArg("wd_key") && server.arg("wd_key") != "") {
       settings.saveSetting<bool>(WARDRIFT_KEY_NAME, server.arg("wd_key"));
+      anyChange = true;
+    }
+
+    // wardrift.net account route upload
+    if (server.hasArg("wd_user")) {
+      String user = server.arg("wd_user");
+      user.trim();
+      String prevUser = settings.loadSetting<String>(WD_USER_NAME);
+      if (user != prevUser) {
+        settings.saveSetting<bool>(WD_USER_NAME, user);
+        wardriftClearSession();  // a token belongs to one account
+      }
+      bool pub = server.hasArg("wd_public") && server.arg("wd_public") == "true";
+      settings.saveSetting<bool>(WD_PUBLIC_NAME, pub);
+      anyChange = true;
+    }
+    if (server.hasArg("wd_pass") && !server.arg("wd_pass").isEmpty()) {
+      settings.saveSetting<bool>(WD_PASS_NAME, server.arg("wd_pass"));
+      wardriftClearSession();  // force a fresh sign-in with the new password
       anyChange = true;
     }
 
@@ -3357,6 +3409,39 @@ void WiFiOps::serveConfigPage() {
     result += "<a href=\"/\">Back</a></body></html>";
 
     server.send(200, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
+  // ---- GET /wdauth : test the saved wardrift account credentials ----
+  server.on("/wdauth", HTTP_GET, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+
+    String user = server.hasArg("user") ? server.arg("user")
+                                        : settings.loadSetting<String>(WD_USER_NAME);
+    String pass = server.hasArg("pass") ? server.arg("pass")
+                                        : settings.loadSetting<String>(WD_PASS_NAME);
+    bool ok = wardrift_client.testSignIn(user, pass);
+
+    String result = "<html><body><h3>";
+    result += ok ? "Signed in to wardrift.net" : "Sign-in failed";
+    result += "</h3>";
+    if (!ok) result += "<p>" + wardrift_client.lastError() + "</p>";
+    result += "<a href=\"/\">Back</a></body></html>";
+    server.send(ok ? 200 : 502, "text/html", result);
+    this->last_web_client_activity = millis();
+  });
+
+  // ---- GET /wdclear : forget the wardrift account credentials ----
+  server.on("/wdclear", HTTP_GET, [this]() {
+    if (!this->checkAuth()) return;
+    this->last_web_client_activity = millis();
+    settings.saveSetting<bool>(WD_USER_NAME, String(""));
+    settings.saveSetting<bool>(WD_PASS_NAME, String(""));
+    wardriftClearSession();
+    server.send(200, "text/html",
+      "<html><body><h3>Wardrift account cleared.</h3>"
+      "<a href=\"/\">Back</a></body></html>");
     this->last_web_client_activity = millis();
   });
 

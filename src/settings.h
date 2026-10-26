@@ -36,6 +36,9 @@
 #define ADMIN_AP_PASS_NAME "ap_pass"   // Admin access point password (String)
 #define CORE_MAC_NAME      "core_mac"  // Node's permitted Core MAC (String)
 #define DEBUG_LOG_NAME     "dbg_en"    // SD debug log enabled (bool)
+#define WD_USER_NAME       "wd_user"   // wardrift.net account username (String)
+#define WD_PASS_NAME       "wd_pass"   // wardrift.net account password (String)
+#define WD_PUBLIC_NAME     "wd_public" // publish uploaded routes publicly (bool)
 // SSID exclusion list keys:  "sx_0" through "sx_9"   (String each)
 // Geofence keys:             "geo_0" through "geo_4" (String, JSON encoded)
 // Geofence JSON format: {"lat":0.000000,"lon":0.000000,"rad":0,"label":""}
