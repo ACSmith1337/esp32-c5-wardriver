@@ -355,16 +355,12 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
 
   String items;
   items.reserve(WD_ITEMS_RESERVE);
-  String batchTs;
   uint16_t batchRows = 0;
   bool ok = true;
 
   auto flush = [&]() -> bool {
     if (batchRows == 0) return true;
-    // device_ts must describe the data, not the upload moment. Using wall
-    // clock here makes every batch look like it happened at upload time and
-    // breaks server-side route grouping.
-    String deviceTs = batchTs.isEmpty() ? isoNow() : batchTs;
+    String deviceTs = isoNow();
     String err;
     int status = 0;
     bool accepted = false;
@@ -408,7 +404,6 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
       return false;
     }
     items = "";
-    batchTs = "";
     batchRows = 0;
     return true;
   };
@@ -432,7 +427,6 @@ bool WardriftClient::uploadFile(const String& filePath, const String& apiKey, St
     }
     if (batchRows > 0) items += ',';
     items += item;
-    batchTs = row.ts;
     batchRows++;
 
     if (batchRows >= WD_BATCH_ROWS) {
